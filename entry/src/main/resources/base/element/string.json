@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "搜图神器"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "搜图神器"
+    }
+  ]
+}
