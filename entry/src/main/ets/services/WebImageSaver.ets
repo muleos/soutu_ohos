@@ -105,9 +105,13 @@ export class WebImageSaver {
     throw lastErr;
   }
 
+  /** 图片魔数校验（公开）：页面 fetch / WebView 下载兜底通道的字节校验入口 */
+  static isImageBytes(data: ArrayBuffer): boolean {
+    return WebImageSaver.isLikelyImage(data);
+  }
+
   /** 图片魔数校验：jpg/png/gif/webp；2xx HTML 防盗链错误页在这里被拒绝 */
-  private static isLikelyImage(data: ArrayBuffer): boolean {
-    try {
+  private static isLikelyImage(data: ArrayBuffer): boolean {    try {
       const bytes = new Uint8Array(data.slice(0, 12));
       if (bytes.length < 4) {
         return false;

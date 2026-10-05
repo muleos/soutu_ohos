@@ -1,6 +1,7 @@
 import { webview } from '@kit.ArkWeb';
 import { promptAction, window, display, mediaquery } from '@kit.ArkUI';
 import { common, Want, OpenLinkOptions, ConfigurationConstant } from '@kit.AbilityKit';
+import { fileIo } from '@kit.CoreFileKit';
 import {
   saveHomeUrl,
   getHomeUrl,
@@ -972,7 +973,7 @@ struct Index {
             })
               .placeholderFont({ size: 13 })
               .fontSize(14)
-              .height(170)
+              .height(90)
               .textAlign(TextAlign.Start)
               .layoutWeight(1)
               .onChange((value) => {
@@ -1807,10 +1808,80 @@ struct Index {
         (be && be.message) ? be.message : '?');
     }
     const data2: ArrayBuffer | null = await this.fetchImageViaPage(url);
-    if (data2 && data2.byteLength > 0) {
+    if (data2 && data2.byteLength > 0 && WebImageSaver.isImageBytes(data2)) {
       return data2;
     }
-    throw new Error('图片源拒绝访问（防盗链或网络受限）');
+    // 3) WebView 网络栈下载兜底：与页面显示图片同一网络上下文（同 UA/同 Cookie/无 Referer 篡改），
+    //    防盗链源站按"浏览器行为"放行——最接近网页自身加载路径的取图方式
+    try {
+      const data3: ArrayBuffer = await this.downloadViaWeb(url);
+      if (data3 && data3.byteLength > 0 && WebImageSaver.isImageBytes(data3)) {
+        return data3;
+      }
+      hilog.warn(0x0000, TAG, 'web download fallback: got %{public}d B but not image',
+        data3 ? data3.byteLength : 0);
+    } catch (err) {
+      const be = err as BusinessError;
+      hilog.warn(0x0000, TAG, 'web download fallback failed: %{public}s',
+        (be && be.message) ? be.message : '?');
+    }
+    let host: string = url;
+    try {
+      const m: RegExpMatchArray | null = url.match(/^https?:\/\/([^/]+)/);
+      if (m && m[1]) {
+        host = m[1];
+      }
+    } catch (err) {
+    }
+    throw new Error('图片源拒绝访问[' + host + ']');
+  }
+
+  /** 用 WebView 网络栈下载 URL 资源，返回文件字节（读完即删临时文件） */
+  private downloadViaWeb(url: string): Promise<ArrayBuffer> {
+    return new Promise<ArrayBuffer>((resolve, reject) => {
+      const delegate = new webview.WebDownloadDelegate();
+      let settled: boolean = false;
+      const finish = (fn: () => void): void => {
+        if (!settled) {
+          settled = true;
+          fn();
+        }
+      };
+      delegate.onDownloadFinish((item: webview.WebDownloadItem) => {
+        try {
+          const path: string = item.getFullPath();
+          hilog.info(0x0000, TAG, 'web download finish: %{public}s', path);
+          const f = fileIo.openSync(path, fileIo.OpenMode.READ_ONLY);
+          const st = fileIo.statSync(f.fd);
+          const buf = new ArrayBuffer(st.size);
+          fileIo.readSync(f.fd, buf);
+          fileIo.closeSync(f);
+          try {
+            fileIo.unlinkSync(path);
+          } catch (err) {
+          }
+          finish(() => resolve(buf));
+        } catch (err) {
+          finish(() => reject(new Error('下载文件读取失败')));
+        }
+      });
+      delegate.onDownloadFailed((item: webview.WebDownloadItem) => {
+        finish(() => reject(new Error('WebView 下载失败(state=' + item.getState() + ')')));
+      });
+      try {
+        webview.WebDownloadManager.setDownloadDelegate(delegate);
+        const ctl: webview.WebviewController =
+          this.detailVisible ? this.detailController : this.controller;
+        ctl.startDownload(url);
+        hilog.info(0x0000, TAG, 'web download start: %{public}s', url.substring(0, 120));
+      } catch (err) {
+        finish(() => reject(new Error('WebView 下载不可用')));
+        return;
+      }
+      setTimeout(() => {
+        finish(() => reject(new Error('WebView 下载超时')));
+      }, 60000);
+    });
   }
 
   /** 长按保存图片：统一取图 → 字节落图库（弹窗/选择器双通道） */
