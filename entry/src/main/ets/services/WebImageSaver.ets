@@ -5,8 +5,8 @@
  * 两段式 API（v1.1.3 重构）：
  *  - fetchImageEx：原生取图，Referer 多策略重试（页面 URL → 空 → 图片自身 origin），
  *    覆盖常见防盗链配置（只允许同域 Referer 或允许空 Referer 的源站）
- *  - saveImageBytes：字节落图库（创建对话框优先，不可用回退安全控件 SaveButton
- *    临时授权直写图库；文件选择器已废弃——保存一律以图片形式入图库，绝不落文件管理）
+ *  - saveViaCreationDialog：字节落图库唯一通道（aira 同构）——系统创建相册对话框
+ *    一步确认，原始字节直写图库；无任何文件选择器回退，绝不落文件管理
  * 全链路 hilog 诊断（TAG: web-savePic），真机排查用 `hdc shell hilog | grep web-savePic`
  */
 import { http } from '@kit.NetworkKit';
@@ -163,64 +163,6 @@ export class WebImageSaver {
       return 'saved';
     }
     return 'cancel';
-  }
-
-  /**
-   * 通道二：安全控件临时授权直写图库 —— 必须在 SaveButton onClick 回调内调用
-   * （点击后约 10s 临时授权窗口内 createAsset 免权限）。绝不落文件管理。
-   */
-  static async saveViaSecurityButton(context: common.UIAbilityContext,
-    data: ArrayBuffer, ext: string): Promise<void> {
-    if (!data || data.byteLength === 0) {
-      throw new Error('图片内容为空');
-    }
-    const helper: photoAccessHelper.PhotoAccessHelper =
-      photoAccessHelper.getPhotoAccessHelper(context);
-    const uri: string = await helper.createAsset(photoAccessHelper.PhotoType.IMAGE, ext);
-    const targetFile = fileIo.openSync(uri, fileIo.OpenMode.READ_WRITE);
-    fileIo.writeSync(targetFile.fd, new Uint8Array(data));
-    fileIo.closeSync(targetFile);
-    hilog.info(0x0000, TAG, 'saved via security button: %{public}s', uri);
-  }
-
-  /**
-   * 字节落图库（兼容入口）：仅走创建对话框通道；对话框不可用抛 NEED_SECURE_BUTTON
-   * 哨兵，由 UI 层打开安全控件确认弹窗。文件选择器（落文件管理）已废弃不再回退。
-   */
-  static async saveImageBytes(context: common.UIAbilityContext, data: ArrayBuffer,
-    url: string): Promise<void> {
-    if (!data || data.byteLength === 0) {
-      throw new Error('图片内容为空');
-    }
-    const ext: string = WebImageSaver.sniffExtension(data, url);
-    const tempPath: string = await WebImageSaver.writeToCache(context, data, ext);
-    try {
-      const r: string = await WebImageSaver.saveViaCreationDialog(context, tempPath, data, ext);
-      if (r === 'saved') {
-        promptAction.showToast({ message: '已保存到图库' });
-      } else {
-        promptAction.showToast({ message: '已取消保存' });
-      }
-    } catch (dialogErr) {
-      const de = dialogErr as BusinessError;
-      hilog.error(0x0000, TAG, 'creation dialog error %{public}d: %{public}s，需回退安全控件',
-        de.code ?? 0, (de && de.message) ? de.message : '?');
-      throw new Error('NEED_SECURE_BUTTON');
-    }
-  }
-
-  /** 兼容旧调用：直取 + 保存一体（内部仍走 fetchImageEx 单 Referer 策略） */
-  static async saveToGallery(context: common.UIAbilityContext, url: string,
-    referer: string, cookie: string, userAgent: string): Promise<void> {
-    try {
-      const data: ArrayBuffer = await WebImageSaver.fetchImageEx(url, referer, cookie, userAgent);
-      await WebImageSaver.saveImageBytes(context, data, url);
-    } catch (err) {
-      const be = err as BusinessError;
-      const msg: string = (be && be.message) ? be.message : '图片无法获取';
-      hilog.error(0x0000, TAG, 'saveToGallery fail: %{public}s', msg);
-      promptAction.showToast({ message: '保存失败：' + msg });
-    }
   }
 
   /** 复制文本（图片链接/视频链接） */
