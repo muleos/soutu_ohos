@@ -177,6 +177,8 @@ struct Index {
   private pendingSaveBytes: ArrayBuffer = new ArrayBuffer(0);
   private pendingSaveExt: string = '';
   private pendingSavePath: string = '';
+  // 无缓存字节时保存预览/直取来源 URL（nas_nav 同构：点保存时才单次 GET）
+  private pendingSaveUrl: string = '';
   private ctxUrl: string = '';
 
 
@@ -1010,11 +1012,13 @@ struct Index {
           }
           .width('100%')
 
-          Row() {
-            TextArea({
-              text: this.c_ua_temp,
-              placeholder: '输入UA（可不填）。点上方[手机][电脑][自定义]文字可复制其UA'
-            })
+          // UA 输入框：仅自定义 UA 时显示（手机/电脑内置 UA 无需输入）
+          if (this.ua_type === 'custom') {
+            Row() {
+              TextArea({
+                text: this.c_ua_temp,
+                placeholder: '输入自定义UA'
+              })
               .placeholderFont({ size: 13 })
               .fontSize(14)
               .height(90)
@@ -1043,6 +1047,7 @@ struct Index {
           }
           .alignItems(VerticalAlign.Top)
           .width('100%')
+          }
           Row()
             .height(10)
 
@@ -1414,12 +1419,14 @@ struct Index {
               .fontSize(16)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.dialog_text'))
-            Image(fileUri.getUriFromPath(this.pendingSavePath))
+            Image(this.pendingSavePath ? fileUri.getUriFromPath(this.pendingSavePath)
+              : this.pendingSaveUrl)
               .height(180)
               .objectFit(ImageFit.Contain)
               .borderRadius(8)
               .backgroundColor($r('app.color.ctx_menu_bg'))
-            Text(this.pendingSaveExt.toUpperCase() + ' · 原始字节无损写入相册')
+            Text(this.pendingSaveExt ? this.pendingSaveExt.toUpperCase() + ' · 原始字节无损写入相册'
+              : '点击系统保存按钮，原图直存入相册')
               .fontSize(12)
               .fontColor($r('app.color.dialog_text'))
               .opacity(0.6)
@@ -1994,46 +2001,29 @@ struct Index {
   }
 
   /**
-   * 长按保存图片（aira 同构）：统一取图 → 魔数校验 → 沙箱缓存 → 系统创建相册
-   * 对话框确认 → 原始字节直写图库。一步到位，无其它选择器，绝不落文件管理。
+   * 长按保存图片（nas_nav 同构）：**不预取、不等待**——立即弹出确认框
+   * （预览：嗅探缓存文件或直接加载 URL），用户点系统安全控件「保存」按钮时
+   * 才在授权窗口内单次原生 GET 取原图 + createImageAssetRequest 直接入库。
+   * 无多级重试链，所以快；无文件选择器，所以必进图库。
    */
-  private async saveWebImage(url: string): Promise<void> {
-    // 同一 URL 保存进行中：直接跳过（防下载拦截回调回环）
+  private saveWebImage(url: string): void {
     if (url && url === this.saveInFlightUrl) {
       return;
     }
     this.saveInFlightUrl = url;
     try {
-      // 资源嗅探缓存命中：页面加载该图时已后台抓取字节 → 直接秒出保存弹窗
+      // 资源嗅探缓存命中：页面加载该图时已后台抓取字节 → 预览直接用字节文件
       const cached: ArrayBuffer | null = ImageResourceSniffer.getCached(url);
       if (cached && cached.byteLength > 0 && WebImageSaver.isLikelyImage(cached)) {
         hilog.info(0x0000, TAG, 'sniffer cache hit, instant save dialog');
-        await this.saveWebImageData(cached, url);
+        this.saveWebImageData(cached, url);
         return;
       }
-      let data: ArrayBuffer | null = null;
-      try {
-        // 45s 总看门狗：取图链路任何一级卡死都不会无声无息（各阶段另有进度提示）
-        data = await Promise.race([
-          this.getWebImageBytes(url),
-          new Promise<ArrayBuffer>((_: (v: ArrayBuffer) => void,
-            rej: (e: Error) => void) => {
-              setTimeout(() => rej(new Error('取图超时，请重试')), 45000);
-            })
-        ]);
-      } catch (err) {
-        const be = err as BusinessError;
-        const msg: string = (be && be.message) ? be.message : '图片无法获取';
-        hilog.error(0x0000, TAG, 'save fetch failed: %{public}s', msg);
-        promptAction.showToast({ message: '保存失败：' + msg });
-        return;
-      }
-      if (!data || !WebImageSaver.isLikelyImage(data)) {
-        hilog.warn(0x0000, TAG, 'save skip: not image content, url=%{public}s', url.substring(0, 120));
-        promptAction.showToast({ message: '该链接不是图片文件' });
-        return;
-      }
-      await this.saveWebImageData(data, url);
+      this.pendingSaveBytes = new ArrayBuffer(0);
+      this.pendingSaveExt = '';
+      this.pendingSavePath = '';
+      this.pendingSaveUrl = url;
+      this.saveBtnVisible = true;
     } finally {
       this.saveInFlightUrl = '';
     }
@@ -2056,6 +2046,7 @@ struct Index {
     this.pendingSaveBytes = data;
     this.pendingSaveExt = ext;
     this.pendingSavePath = cachePath;
+    this.pendingSaveUrl = '';
     hilog.info(0x0000, TAG, 'open save dialog: %{public}s (%{public}d B)', cachePath, data.byteLength);
     this.saveBtnVisible = true;
   }
@@ -2066,18 +2057,39 @@ struct Index {
     this.pendingSaveBytes = new ArrayBuffer(0);
     this.pendingSaveExt = '';
     this.pendingSavePath = '';
+    this.pendingSaveUrl = '';
   }
 
-  /** 系统安全控件 SaveButton 点击回调内执行：临时授权窗口内 createAsset 直写图库 */
+  /**
+   * 系统安全控件 SaveButton 点击回调内执行（nas_nav 同构，临时授权窗口内）：
+   * 优先用嗅探缓存字节；无缓存则单次原生 GET 直取原图（空 Referer，图床放行）
+   * → 写沙箱 → createImageAssetRequest + applyChanges 直接入库。失败回退
+   * createAsset 直写。全链路无文件选择器。
+   */
   private async doSecureSave(): Promise<void> {
-    const data: ArrayBuffer = this.pendingSaveBytes;
-    const ext: string = this.pendingSaveExt;
-    if (!data || data.byteLength === 0) {
-      this.closeSaveDialog();
-      return;
-    }
+    let path: string = this.pendingSavePath;
+    let fetched: string = '';
     try {
-      await WebImageSaver.saveViaSecurityButton(context_index, data, ext);
+      if (!this.pendingSaveBytes || this.pendingSaveBytes.byteLength === 0) {
+        fetched = await WebImageSaver.downloadImageSimple(this.pendingSaveUrl);
+        path = fetched;
+      }
+      try {
+        await WebImageSaver.saveViaAssetChangeRequest(path);
+      } catch (err) {
+        const be = err as BusinessError;
+        hilog.warn(0x0000, TAG, 'applyChanges failed %{public}d, fallback createAsset: %{public}s',
+          be.code ?? 0, (be && be.message) ? be.message : '?');
+        // 兜底：读回沙箱文件字节 → createAsset 直写（不同授权模型的第二通道）
+        const f = fileIo.openSync(path, fileIo.OpenMode.READ_ONLY);
+        const st = fileIo.statSync(f.fd);
+        const buf = new ArrayBuffer(st.size);
+        fileIo.readSync(f.fd, buf);
+        fileIo.closeSync(f);
+        const ext: string = this.pendingSaveExt ||
+          WebImageSaver.sniffExtension(buf, this.pendingSaveUrl);
+        await WebImageSaver.saveViaSecurityButton(context_index, buf, ext);
+      }
       promptAction.showToast({ message: '已保存到图库' });
     } catch (err) {
       const be = err as BusinessError;
@@ -2085,6 +2097,9 @@ struct Index {
       hilog.error(0x0000, TAG, 'secure save failed: %{public}s', msg);
       promptAction.showToast({ message: '保存失败：' + msg });
     } finally {
+      if (fetched && fetched !== this.pendingSavePath) {
+        this.cleanupSaveCache(fetched);
+      }
       this.closeSaveDialog();
     }
   }

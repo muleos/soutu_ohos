@@ -184,6 +184,68 @@ export class WebImageSaver {
     hilog.info(0x0000, TAG, 'saved via security button: %{public}s', uri);
   }
 
+  /** 提取 URL 主机名（错误提示定位图源用） */
+  static urlHost(url: string): string {
+    const m: RegExpMatchArray | null = url.match(/^https?:\/\/([^\/?#]+)/);
+    return m ? m[1] : url.substring(0, 60);
+  }
+
+  /**
+   * nas_nav 同构下载：安全控件授权窗口内**单次原生 GET**（默认无 Referer——
+   * 花瓣等图床对空 Referer 放行），魔数校验后写沙箱缓存，返回文件路径。
+   * 无多级重试，一次到位（快）。
+   */
+  static async downloadImageSimple(url: string): Promise<string> {
+    const httpRequest = http.createHttp();
+    try {
+      const resp: http.HttpResponse = await httpRequest.request(url, {
+        method: http.RequestMethod.GET,
+        expectDataType: http.HttpDataType.ARRAY_BUFFER,
+        usingCache: true,
+        connectTimeout: 10000,
+        readTimeout: 15000,
+        maxLimit: MAX_BYTES / 1024
+      });
+      if (resp.responseCode !== http.ResponseCode.OK || !(resp.result instanceof ArrayBuffer)) {
+        const code: number = resp.responseCode as number;
+        throw new Error('图源返回 ' + code + ' [' + WebImageSaver.urlHost(url) + ']');
+      }
+      const data: ArrayBuffer = resp.result as ArrayBuffer;
+      if (!data || data.byteLength === 0 || !WebImageSaver.isLikelyImage(data)) {
+        throw new Error('图源返回非图片内容 [' + WebImageSaver.urlHost(url) + ']');
+      }
+      const ext: string = WebImageSaver.sniffExtension(data, url);
+      return await WebImageSaver.writeToCache(WebImageSaver.appContext(), data, ext);
+    } finally {
+      httpRequest.destroy();
+    }
+  }
+
+  /** 当前 UIAbility 上下文（downloadImageSimple 沙箱写入用） */
+  private static appContext(): common.UIAbilityContext {
+    return getContext() as common.UIAbilityContext;
+  }
+
+  /**
+   * nas_nav 同构入库（关键差异）：媒体库变更请求 `createImageAssetRequest` +
+   * `applyChanges`——原始字节经沙箱文件登记进系统图库。与 createAsset+fd 直写
+   * 相比授权模型不同，在部分设备上更可靠（nas_nav 实测可用）。
+   * 必须在 SaveButton onClick 临时授权窗口内调用。
+   */
+  static async saveViaAssetChangeRequest(sandboxPath: string): Promise<void> {
+    if (!sandboxPath || sandboxPath.length === 0) {
+      throw new Error('图片文件未就绪');
+    }
+    const context = getContext() as common.UIAbilityContext;
+    const helper: photoAccessHelper.PhotoAccessHelper =
+      photoAccessHelper.getPhotoAccessHelper(context);
+    const assetChangeRequest: photoAccessHelper.MediaAssetChangeRequest =
+      photoAccessHelper.MediaAssetChangeRequest.createImageAssetRequest(context, sandboxPath);
+    await helper.applyChanges(assetChangeRequest);
+    hilog.info(0x0000, TAG, 'saved via asset change request: %{public}s',
+      assetChangeRequest.getAsset().uri);
+  }
+
   /** 复制文本（图片链接/视频链接） */
   static copyText(text: string, tip: string): void {
     try {
