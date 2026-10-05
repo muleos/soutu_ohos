@@ -1,5 +1,5 @@
 import { webview } from '@kit.ArkWeb';
-import { promptAction, window, display } from '@kit.ArkUI';
+import { promptAction, window, display, mediaquery } from '@kit.ArkUI';
 import { common, Want, OpenLinkOptions, ConfigurationConstant } from '@kit.AbilityKit';
 import {
   saveHomeUrl,
@@ -36,6 +36,8 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { BusinessError, systemDateTime } from '@kit.BasicServicesKit';
 import { preferences } from '@kit.ArkData';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+import { util } from '@kit.ArkTS';
 
 enum ScreenOrientation {
   PORTRAIT = display.Orientation.PORTRAIT,
@@ -136,6 +138,12 @@ struct Index {
   @State isFull: string = 'true';
   @State slide_num: number = 0.3;
   @State webDark: string = 'auto'; // 'auto'=跟随系统深浅色, 'dark'=强制深色
+  // 系统深浅色监听：系统切深色时强制深色按钮自动开，切浅色时自动关
+  private darkMQL: mediaquery.MediaQueryListener | null = null;
+  // 页面内取图桥（__STQ_IMGB64__）分片缓存：reqId -> 已收分片（按 seq 追加）
+  private imgChunks: Map<string, string[]> = new Map();
+  // reqId -> 期望分片数（-1 表示页面侧取图失败）
+  private imgTotal: Map<string, number> = new Map();
   // 沉浸式：状态栏高度留白(px->vp)，供下拉顶栏避开状态栏
   @State safeTopVp: number = 0;
   // 底栏抬高设置值(0-30vp)：设置面板可调，抬高网页视口底部，避免网页底栏被小白条手势区压住
@@ -296,6 +304,14 @@ struct Index {
       // 系统深浅色切换：用最近采样色强制重设系统栏
       this.applyImmersiveTheme(this.lastTopBg, this.lastBottomBg, true);
     });
+    // 强制深色跟随系统：系统深色→开关自动打开；系统浅色→自动关闭
+    try {
+      this.darkMQL = mediaquery.matchMediaSync('(dark-mode: dark)');
+      this.darkMQL.on('change', (res: mediaquery.MediaQueryResult) => {
+        this.syncWebDarkToSystem(res.matches as boolean);
+      });
+    } catch (err) {
+    }
     // 网页缓存管理：记录最后使用时间；超过 7 天未使用，启动时自动清除缓存
     preferences.getPreferences(context_index, 'stq_web_cache').then((pref) => {
       const now: number = systemDateTime.getTime();
@@ -349,6 +365,13 @@ struct Index {
     if (!this.webReady && this.saved_home_url) {
       this.firstSrc = this.saved_home_url;
     }
+    // 强制深色初始同步（在偏好读取后执行，避免被持久化值覆盖）：系统深色→开，浅色→关
+    try {
+      if (this.darkMQL) {
+        this.syncWebDarkToSystem(this.darkMQL.matches as boolean);
+      }
+    } catch (err) {
+    }
     setTimeout(() => {
       this.backToHome();
       this.setSystemFull(this.isFull, this.isHidestatus, this.isHidebar);
@@ -360,6 +383,30 @@ struct Index {
 
     })
     EmitterUtil.unSubscribe('stq_color_mode_changed');
+    try {
+      if (this.darkMQL) {
+        this.darkMQL.off('change');
+        this.darkMQL = null;
+      }
+    } catch (err) {
+    }
+  }
+
+  /** 强制深色开关同步到系统深浅色状态（系统切换时自动开/关，覆盖持久化值） */
+  private syncWebDarkToSystem(sysDark: boolean): void {
+    const target: string = sysDark ? 'dark' : 'auto';
+    if (this.webDark === target) {
+      return;
+    }
+    this.webDark = target;
+    saveWebDarkMode(this.webDark);
+    this.lastTopBg = '';
+    this.lastBottomBg = '';
+    this.applyImmersiveTheme('', '', true);
+    hilog.info(0x0000, TAG, 'dark mode synced to system: %{public}s', target);
+    if (this.webReady) {
+      this.refreshWeb();
+    }
   }
 
   @Builder
@@ -519,6 +566,9 @@ struct Index {
                 // 沉浸式取色桥：页面探针经 console 上报主题背景色
                 if (event && event.message) {
                   const msg: string = event.message.getMessage() || '';
+                  if (msg.indexOf('__STQ_IMGB64__') === 0) {
+                    return this.handleImgBridge(msg);
+                  }
                   if (msg.indexOf('__STQ_CHROME__') === 0) {
                     try {
                       const payload = JSON.parse(msg.substring('__STQ_CHROME__'.length)) as Record<string, string>;
@@ -677,6 +727,9 @@ struct Index {
               // 沉浸式取色桥：与主 Web 同一探针，浮层期间系统栏跟随详情页配色
               if (event && event.message) {
                 const msg: string = event.message.getMessage() || '';
+                if (msg.indexOf('__STQ_IMGB64__') === 0) {
+                  return this.handleImgBridge(msg);
+                }
                 if (msg.indexOf('__STQ_CHROME__') === 0) {
                   try {
                     const payload = JSON.parse(msg.substring('__STQ_CHROME__'.length)) as Record<string, string>;
@@ -1593,23 +1646,150 @@ struct Index {
     }
   }
 
+  /** 解析页面内取图桥的分片消息：__STQ_IMGB64__<reqId>:<seq|meta|err>:<total>:<chunk> */
+  private handleImgBridge(msg: string): boolean {
+    try {
+      const prefix = '__STQ_IMGB64__';
+      const rest: string = msg.substring(prefix.length);
+      const c1: number = rest.indexOf(':');
+      if (c1 <= 0) {
+        return true;
+      }
+      const reqId: string = rest.substring(0, c1);
+      const c2: number = rest.indexOf(':', c1 + 1);
+      if (c2 <= 0) {
+        return true;
+      }
+      const tag: string = rest.substring(c1 + 1, c2);
+      if (tag === 'err') {
+        // 页面侧取图失败：置 -1 让等待方立即退出
+        this.imgTotal.set(reqId, -1);
+        return true;
+      }
+      const c3: number = rest.indexOf(':', c2 + 1);
+      if (tag === 'meta') {
+        const total: number = Number(rest.substring(c2 + 1, c3 < 0 ? rest.length : c3)) || 0;
+        this.imgTotal.set(reqId, total);
+        if (!this.imgChunks.has(reqId)) {
+          this.imgChunks.set(reqId, []);
+        }
+        return true;
+      }
+      const seq: number = Number(tag);
+      if (isNaN(seq)) {
+        return true;
+      }
+      // 数据分片格式 reqId:seq:total:chunk；base64 不含 ':'，直接取最后一段
+      const chunk: string = c3 >= 0 ? rest.substring(c3 + 1) : rest.substring(c2 + 1);
+      let parts: string[] | undefined = this.imgChunks.get(reqId);
+      if (!parts) {
+        parts = [];
+        this.imgChunks.set(reqId, parts);
+      }
+      parts.push(chunk);
+      return true;
+    } catch (err) {
+      return true;
+    }
+  }
+
+  /** 兜底取图：在 WebView 页面上下文内 fetch（同 <img> 的 Cookie/UA/凭证上下文），base64 分片回传 */
+  private async fetchImageViaPage(url: string): Promise<ArrayBuffer | null> {
+    const ctl: webview.WebviewController =
+      this.detailVisible ? this.detailController : this.controller;
+    const reqId: string = 'r' + Date.now().toString();
+    this.imgChunks.delete(reqId);
+    this.imgTotal.delete(reqId);
+    try {
+      await ctl.runJavaScript('window.__stqFetchImage && window.__stqFetchImage('
+        + JSON.stringify(reqId) + ',' + JSON.stringify(url) + ')');
+    } catch (err) {
+      const be = err as BusinessError;
+      hilog.warn(0x0000, TAG, 'page fetch inject fail: %{public}s', (be && be.message) ? be.message : '?');
+      return null;
+    }
+    const deadline: number = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      const total: number = this.imgTotal.get(reqId) || 0;
+      if (total === -1) {
+        hilog.warn(0x0000, TAG, 'page fetch rejected by page context (CORS/网络)');
+        return null;
+      }
+      const parts: string[] | undefined = this.imgChunks.get(reqId);
+      if (total > 0 && parts && parts.length >= total) {
+        let b64: string = '';
+        for (let i = 0; i < total; i++) {
+          b64 += (parts[i] || '');
+        }
+        try {
+          const helper = new util.Base64Helper();
+          const u8: Uint8Array = helper.decodeSync(b64);
+          return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer;
+        } catch (err) {
+          hilog.warn(0x0000, TAG, 'page fetch base64 decode fail');
+          return null;
+        }
+      }
+      await this.sleepMs(120);
+    }
+    hilog.warn(0x0000, TAG, 'page fetch timeout');
+    return null;
+  }
+
+  private sleepMs(ms: number): Promise<void> {
+    return new Promise<void>((resolve: () => void) => {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  /** 长按保存图片：原生多 Referer 直取 → 失败回退页面内 fetch → 字节落图库（弹窗/选择器双通道） */
+  private async saveWebImage(url: string): Promise<void> {
+    const ctl: webview.WebviewController =
+      this.detailVisible ? this.detailController : this.controller;
+    let pageUrl: string = '';
+    try {
+      pageUrl = ctl.getUrl() || '';
+    } catch (err) {
+      pageUrl = '';
+    }
+    let cookie: string = '';
+    try {
+      cookie = webview.WebCookieManager.fetchCookieSync(url) || '';
+    } catch (err) {
+      cookie = '';
+    }
+    // 1) 原生直取（Referer 依次：当前页 URL → 空 → 图片自身 origin）
+    try {
+      const data: ArrayBuffer =
+        await WebImageSaver.fetchImageEx(url, pageUrl, cookie, this.userAgent);
+      if (data && data.byteLength > 0) {
+        await WebImageSaver.saveImageBytes(context_index, data, url);
+        return;
+      }
+    } catch (err) {
+      const be = err as BusinessError;
+      hilog.warn(0x0000, TAG, 'native fetch all strategies failed: %{public}s',
+        (be && be.message) ? be.message : '?');
+    }
+    // 2) 页面内 fetch 兜底（同源图/带 CORS 头的跨域图；与 <img> 同凭证上下文）
+    try {
+      const data2: ArrayBuffer | null = await this.fetchImageViaPage(url);
+      if (data2 && data2.byteLength > 0) {
+        await WebImageSaver.saveImageBytes(context_index, data2, url);
+        return;
+      }
+      promptAction.showToast({ message: '保存失败：图片源拒绝访问（防盗链或网络受限）' });
+    } catch (err) {
+      const be = err as BusinessError;
+      promptAction.showToast({ message: '保存失败：' + ((be && be.message) ? be.message : '未知错误') });
+    }
+  }
+
   onCtxItem(item: string): void {
     this.ctxVisible = false;
     const url = this.ctxUrl;
     if (item === '保存图片') {
-      let cookie: string = '';
-      try {
-        cookie = webview.WebCookieManager.fetchCookieSync(url) || '';
-      } catch (err) {
-        cookie = '';
-      }
-      let pageUrl: string = '';
-      try {
-        pageUrl = this.controller.getUrl() || '';
-      } catch (err) {
-        pageUrl = '';
-      }
-      WebImageSaver.saveToGallery(context_index, url, pageUrl, cookie, this.userAgent);
+      this.saveWebImage(url);
     } else if (item === '复制图片链接' || item === '复制视频链接') {
       WebImageSaver.copyText(url, '已复制链接');
     } else if (item === '其他应用打开') {

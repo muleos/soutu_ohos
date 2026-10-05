@@ -304,5 +304,48 @@ export const WEB_CHROME_SCRIPT: string = `
     } catch (err) { }
   }, true);
 })();
+
+;(function () {
+  /* 图片保存兜底桥：原生直取被源站拒绝（防盗链/TLS 指纹）时，改在页面上下文内 fetch
+   * ——与 <img> 同一 Cookie/UA/凭证上下文，同源图与带 CORS 头的跨域图均可取回。
+   * 结果转 base64 分片经 console 回传：__STQ_IMGB64__<reqId>:<seq|meta|err>:<total>:<chunk>
+   * （base64 字符集不含 ':'，分片解析安全；原生侧拼装后写图库。） */
+  if (window.__stqImgBridgeInstalled) { return; }
+  window.__stqImgBridgeInstalled = 1;
+  window.__stqFetchImage = function (reqId, url) {
+    var CHUNK = 32768;
+    function report(s) { try { console.info(s); } catch (e) { } }
+    function fail(m) { report('__STQ_IMGB64__' + reqId + ':err:' + m); }
+    try {
+      fetch(url, { credentials: 'include', referrerPolicy: 'no-referrer-when-downgrade' })
+        .then(function (r) {
+          if (!r.ok) { throw new Error('HTTP ' + r.status); }
+          return r.blob();
+        })
+        .then(function (b) {
+          var fr = new FileReader();
+          fr.onload = function () {
+            try {
+              var dataUrl = String(fr.result || '');
+              var comma = dataUrl.indexOf(',');
+              var b64 = comma >= 0 ? dataUrl.substring(comma + 1) : '';
+              if (!b64) { fail('empty'); return; }
+              var total = Math.ceil(b64.length / CHUNK);
+              report('__STQ_IMGB64__' + reqId + ':meta:' + total + ':' + b64.length);
+              for (var i = 0; i < total; i++) {
+                report('__STQ_IMGB64__' + reqId + ':' + i + ':' + total + ':'
+                  + b64.substring(i * CHUNK, (i + 1) * CHUNK));
+              }
+            } catch (e) { fail(e && e.message ? e.message : 'read'); }
+          };
+          fr.onerror = function () { fail('fileReader'); };
+          fr.readAsDataURL(b);
+        })
+        .catch(function (e) { fail(e && e.message ? e.message : 'fetch'); });
+    } catch (e) {
+      fail(e && e.message ? e.message : 'throw');
+    }
+  };
+})();
 //# sourceURL=stq-web-chrome.js
 `;
