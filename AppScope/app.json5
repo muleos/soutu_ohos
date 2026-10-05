@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.hmos.soutu",
     "vendor": "muleos",
-    "versionCode": 100016,
-    "versionName": "1.2.5",
+    "versionCode": 100017,
+    "versionName": "1.2.6",
     "icon": "$media:app_icon",
     "label": "$string:app_name"
   }
