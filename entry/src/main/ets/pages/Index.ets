@@ -1,6 +1,6 @@
 import { webview } from '@kit.ArkWeb';
 import { promptAction, window, display, mediaquery } from '@kit.ArkUI';
-import { common, Want, OpenLinkOptions, ConfigurationConstant } from '@kit.AbilityKit';
+import { common, Want, OpenLinkOptions } from '@kit.AbilityKit';
 import {
   saveHomeUrl,
   getHomeUrl,
@@ -137,8 +137,9 @@ struct Index {
   @State isHidestatus: string = 'false';
   @State isFull: string = 'true';
   @State slide_num: number = 0.3;
-  @State webDark: string = 'auto'; // 'auto'=跟随系统深浅色, 'dark'=强制深色
-  // 系统深浅色监听：系统切深色时强制深色按钮自动开，切浅色时自动关
+  @State webDark: string = 'auto'; // 'auto'=开关关闭(始终浅色), 'dark'=开关打开(深色跟随系统)
+  @State sysDark: boolean = false; // 系统当前是否深色（mediaquery 实时同步）
+  // 系统深浅色监听：开关打开时，网页深色随系统切换（系统深色→深色显示，浅色→浅色显示）
   private darkMQL: mediaquery.MediaQueryListener | null = null;
   // 页面内取图桥（__STQ_IMGB64__）分片缓存：reqId -> 已收分片（按 seq 追加）
   private imgChunks: Map<string, string[]> = new Map();
@@ -304,11 +305,11 @@ struct Index {
       // 系统深浅色切换：用最近采样色强制重设系统栏
       this.applyImmersiveTheme(this.lastTopBg, this.lastBottomBg, true);
     });
-    // 强制深色跟随系统：系统深色→开关自动打开；系统浅色→自动关闭
+    // 强制深色跟随系统：开关打开时，网页深色随系统深浅色变化
     try {
       this.darkMQL = mediaquery.matchMediaSync('(dark-mode: dark)');
       this.darkMQL.on('change', (res: mediaquery.MediaQueryResult) => {
-        this.syncWebDarkToSystem(res.matches as boolean);
+        this.onSystemDarkChanged(res.matches as boolean);
       });
     } catch (err) {
     }
@@ -365,10 +366,10 @@ struct Index {
     if (!this.webReady && this.saved_home_url) {
       this.firstSrc = this.saved_home_url;
     }
-    // 强制深色初始同步（在偏好读取后执行，避免被持久化值覆盖）：系统深色→开，浅色→关
+    // 初始系统深浅色同步（在偏好读取后执行）：开关打开时按系统深浅色决定网页深色
     try {
       if (this.darkMQL) {
-        this.syncWebDarkToSystem(this.darkMQL.matches as boolean);
+        this.onSystemDarkChanged(this.darkMQL.matches as boolean);
       }
     } catch (err) {
     }
@@ -392,21 +393,25 @@ struct Index {
     }
   }
 
-  /** 强制深色开关同步到系统深浅色状态（系统切换时自动开/关，覆盖持久化值） */
-  private syncWebDarkToSystem(sysDark: boolean): void {
-    const target: string = sysDark ? 'dark' : 'auto';
-    if (this.webDark === target) {
+  /** 系统深浅色变化：仅开关打开时响应——系统深色→网页深色；系统浅色→网页浅色。开关状态本身不变 */
+  private onSystemDarkChanged(sysDark: boolean): void {
+    const changed: boolean = sysDark !== this.sysDark;
+    this.sysDark = sysDark;
+    if (!changed || !this.get_isWebDark()) {
       return;
     }
-    this.webDark = target;
-    saveWebDarkMode(this.webDark);
     this.lastTopBg = '';
     this.lastBottomBg = '';
     this.applyImmersiveTheme('', '', true);
-    hilog.info(0x0000, TAG, 'dark mode synced to system: %{public}s', target);
+    hilog.info(0x0000, TAG, 'web dark follows system: %{public}s', sysDark ? 'dark' : 'light');
     if (this.webReady) {
       this.refreshWeb();
     }
+  }
+
+  /** 网页最终深色状态：强制深色开关打开 且 系统当前为深色（系统浅色时保持浅色显示） */
+  private isWebDarkNow(): boolean {
+    return this.get_isWebDark() && this.sysDark;
   }
 
   @Builder
@@ -558,8 +563,8 @@ struct Index {
               .fileAccess(true)
               .mediaPlayGestureAccess(true)
               .mixedMode(MixedMode.Compatible)
-              .darkMode(this.webDark === 'dark' ? WebDarkMode.On : WebDarkMode.Auto)
-              .forceDarkAccess(this.webDark === 'dark')
+              .darkMode(this.isWebDarkNow() ? WebDarkMode.On : WebDarkMode.Off)
+              .forceDarkAccess(this.isWebDarkNow())
               .backgroundColor($r('app.color.panel_bg'))
               .javaScriptOnDocumentStart([{ script: WEB_CHROME_SCRIPT, scriptRules: ['*'] }])
               .onConsole((event) => {
@@ -774,8 +779,8 @@ struct Index {
             .fileAccess(true)
             .mediaPlayGestureAccess(true)
             .mixedMode(MixedMode.Compatible)
-            .darkMode(this.webDark === 'dark' ? WebDarkMode.On : WebDarkMode.Auto)
-            .forceDarkAccess(this.webDark === 'dark')
+            .darkMode(this.isWebDarkNow() ? WebDarkMode.On : WebDarkMode.Off)
+            .forceDarkAccess(this.isWebDarkNow())
             .javaScriptOnDocumentStart([{ script: WEB_CHROME_SCRIPT, scriptRules: ['*'] }])
             .backgroundColor($r('app.color.panel_bg'))
             .width('100%')
@@ -941,13 +946,13 @@ struct Index {
           Row() {
             TextArea({
               text: this.c_ua_temp,
-              //text: this.c_pg_ua,
-              placeholder: '请输入UA(可不填)，确认才保存.点击上方[手机][电脑][自定义]文字可以将其UA复制到此处。'
+              placeholder: '输入UA（可不填）。点上方[手机][电脑][自定义]文字可复制其UA'
             })
-            //.maxLines(5)
-              .height(190)
+              .placeholderFont({ size: 13 })
+              .fontSize(14)
+              .height(170)
               .textAlign(TextAlign.Start)
-              .width("82%")
+              .layoutWeight(1)
               .onChange((value) => {
                 this.c_ua_temp = value;
               })
@@ -957,7 +962,7 @@ struct Index {
 
             Button('保存')
               .height(32)
-              .width("18%")
+              .width(72)
               .type(ButtonType.Capsule)
               //.backgroundColor(Color.Blue)
               .onClick(() => {
@@ -969,9 +974,8 @@ struct Index {
                 }
               })
           }
-          .visibility(Visibility.Visible)
-
-          //.alignItems(VerticalAlign.Top)
+          .alignItems(VerticalAlign.Top)
+          .width('100%')
           Row()
             .height(10)
 
@@ -1111,6 +1115,8 @@ struct Index {
                 this.lastBottomBg = '';
                 this.applyImmersiveTheme('', '', true);
                 this.refreshWeb();
+                // 开关打开瞬间即按当前系统深浅色生效，无需等下一次系统切换
+                this.onSystemDarkChanged(this.sysDark);
               })
           }
 
@@ -1801,18 +1807,9 @@ struct Index {
     }
   }
 
-  /** 是否深色模式：开启强制深色，或系统当前为深色 */
+  /** 是否深色渲染：强制深色开关打开 且 系统当前为深色（开关语义=深色跟随系统） */
   private isDarkModeNow(): boolean {
-    if (this.webDark === 'dark') {
-      return true;
-    }
-    try {
-      if (context_index.config?.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK) {
-        return true;
-      }
-    } catch (err) {
-    }
-    return false;
+    return this.get_isWebDark() && this.sysDark;
   }
 
   /** 亮度反转（HSV 的 V 取反、降饱和）：用于强制深色渲染时把浅色采样色转成深色 */
