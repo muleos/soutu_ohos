@@ -1851,7 +1851,8 @@ struct Index {
    * 统一取图通道（保存/复制/分享共用）：
    * 1) 原生直取（URL 候选 × Referer 策略组合重试，含魔数校验）
    * 2) 页面内 fetch 兜底（同源图/带 CORS 头的跨域图，与 <img> 同凭证上下文）
-   * 两级都失败抛错，由调用方提示。
+   * 3) WebView 网络栈下载兜底
+   * 每级开始均有 toast 进度提示；调用方另有 45s 总看门狗。
    */
   private async getWebImageBytes(url: string): Promise<ArrayBuffer> {
     const ctl: webview.WebviewController =
@@ -1868,6 +1869,7 @@ struct Index {
     } catch (err) {
       cookie = '';
     }
+    promptAction.showToast({ message: '正在直连图源…', duration: 2000 });
     try {
       const data: ArrayBuffer =
         await WebImageSaver.fetchImageEx(url, pageUrl, cookie, this.userAgent);
@@ -1879,12 +1881,14 @@ struct Index {
       hilog.warn(0x0000, TAG, 'native fetch all strategies failed: %{public}s',
         (be && be.message) ? be.message : '?');
     }
+    promptAction.showToast({ message: '直连受限，正在页面内取图…', duration: 2000 });
     const data2: ArrayBuffer | null = await this.fetchImageViaPage(url);
     if (data2 && data2.byteLength > 0 && WebImageSaver.isImageBytes(data2)) {
       return data2;
     }
     // 3) WebView 网络栈下载兜底：与页面显示图片同一网络上下文（同 UA/同 Cookie/无 Referer 篡改），
     //    防盗链源站按"浏览器行为"放行——最接近网页自身加载路径的取图方式
+    promptAction.showToast({ message: '正在经浏览器通道取图…', duration: 2000 });
     try {
       const data3: ArrayBuffer = await this.downloadViaWeb(url);
       if (data3 && data3.byteLength > 0 && WebImageSaver.isImageBytes(data3)) {
@@ -1972,10 +1976,16 @@ struct Index {
     }
     this.saveInFlightUrl = url;
     try {
-      promptAction.showToast({ message: '正在获取图片…', duration: 1500 });
       let data: ArrayBuffer | null = null;
       try {
-        data = await this.getWebImageBytes(url);
+        // 45s 总看门狗：取图链路任何一级卡死都不会无声无息（各阶段另有进度提示）
+        data = await Promise.race([
+          this.getWebImageBytes(url),
+          new Promise<ArrayBuffer>((_: (v: ArrayBuffer) => void,
+            rej: (e: Error) => void) => {
+              setTimeout(() => rej(new Error('取图超时，请重试')), 45000);
+            })
+        ]);
       } catch (err) {
         const be = err as BusinessError;
         const msg: string = (be && be.message) ? be.message : '图片无法获取';
@@ -2011,6 +2021,7 @@ struct Index {
     this.pendingSaveBytes = data;
     this.pendingSaveExt = ext;
     this.pendingSavePath = cachePath;
+    hilog.info(0x0000, TAG, 'open save dialog: %{public}s (%{public}d B)', cachePath, data.byteLength);
     this.saveBtnVisible = true;
   }
 

@@ -263,8 +263,9 @@ export class WebImageSaver {
         method: http.RequestMethod.GET,
         header: header,
         expectDataType: http.HttpDataType.ARRAY_BUFFER,
-        connectTimeout: 10000,
-        readTimeout: 20000,
+        connectTimeout: 8000,
+        readTimeout: 12000,
+        usingCache: true,
         maxLimit: MAX_BYTES / 1024
       });
       hilog.info(0x0000, TAG, 'HTTP %{public}d, %{public}s', resp.responseCode, url.substring(0, 120));
