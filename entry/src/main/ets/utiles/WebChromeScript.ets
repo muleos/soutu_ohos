@@ -158,6 +158,8 @@ export const WEB_CHROME_SCRIPT: string = `
   // 页面不可见时跳过采样，降低后台 CPU/电量开销
   setInterval(function () { if (!document.hidden) { scheduleTheme(); } }, 2000);
   scheduleTheme();
+  /* 暴露给原生：详情浮层关闭后主动重报底层页面主题色 */
+  window.__stqScheduleTheme = scheduleTheme;
 })();
 //# sourceURL=stq-web-chrome.js
 `;

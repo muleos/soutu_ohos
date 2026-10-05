@@ -96,6 +96,12 @@ struct Index {
   })
 
   private shouldClearCache: boolean = false;
+  // 搜图神器适配：图片详情浮层。详情在独立 Web 实例中打开，返回时销毁浮层，
+  // 底层首页/搜索页保持挂载原状（组件不卸载、滚动位置不变、零重载）
+  @State detailVisible: boolean = false;
+  @State detailUrl: string = '';
+  private detailController: webview.WebviewController = new webview.WebviewController();
+  private detailDownloadFile: IAbstractDownloadHandler = new WebDownloadFileHelper();
   // Cookie 登录（v1.7.4）：设置面板粘贴网页版 Cookie 写入 WebView CookieStore
   @State savedCookie: string = '';
   @State cookieInput: string = '';
@@ -509,6 +515,11 @@ struct Index {
                   }
                   // 主文档导航：按页面层级刷新状态栏避让（首页沉浸，二三级避让）
                   if ((scheme === 'http' || scheme === 'https') && event.data.isMainFrame()) {
+                    // 搜图神器适配：详情页改走浮层 Web 打开，返回时底层页面保持原状不重载
+                    if (!this.detailVisible && this.isDetailUrl(url)) {
+                      this.openDetailOverlay(url);
+                      return true;
+                    }
                     this.pageUrl = url;
                     this.updateSafeTop();
                   }
@@ -598,6 +609,89 @@ struct Index {
       })
       .width('100%')
       .height('100%')
+
+      // 搜图神器适配：详情浮层（独立 Web 加载详情，返回销毁浮层，底层页面不重载）
+      if (this.detailVisible) {
+        Stack() {
+          Web({ src: this.detailUrl, controller: this.detailController })
+            .onControllerAttached(() => {
+              this.detailController.setNetworkAvailable(true);
+              this.detailDownloadFile.setDownloadDelegate(this.detailController);
+              try {
+                this.detailController.setCustomUserAgent(this.getuseragentbytype(this.ua_type));
+              } catch (error) {
+              }
+            })
+            .onConsole((event) => {
+              // 沉浸式取色桥：与主 Web 同一探针，浮层期间系统栏跟随详情页配色
+              if (event && event.message) {
+                const msg: string = event.message.getMessage() || '';
+                if (msg.indexOf('__STQ_CHROME__') === 0) {
+                  try {
+                    const payload = JSON.parse(msg.substring('__STQ_CHROME__'.length)) as Record<string, string>;
+                    this.applyImmersiveTheme(payload.bg || '', payload.bbg || '');
+                  } catch (err) {
+                  }
+                }
+              }
+              return false;
+            })
+            .onContextMenuShow((event) => {
+              return this.handleWebContextMenu(event);
+            })
+            .onLoadIntercept((event) => {
+              if (event && event.data) {
+                const url: string = event.data.getRequestUrl() || '';
+                const scheme: string = url.split(':')[0]?.toLowerCase() || '';
+                const webSchemes: string[] = ['http', 'https', 'file', 'about', 'data', 'blob', 'javascript'];
+                if (scheme !== '' && !webSchemes.includes(scheme)) {
+                  this.openExternalApp(url);
+                  return true;
+                }
+                // 详情页内站点返回按钮路由回首页时：关闭浮层露出未重载的底层页面
+                if ((scheme === 'http' || scheme === 'https') && event.data.isMainFrame()) {
+                  if (this.isTopLevelUrl(url) || this.isHomePathUrl(url)) {
+                    this.closeDetailOverlay();
+                    return true;
+                  }
+                }
+              }
+              return false;
+            })
+            .domStorageAccess(true)
+            .javaScriptAccess(true)
+            .geolocationAccess(true)
+            .imageAccess(true)
+            .onlineImageAccess(true)
+            .fileAccess(true)
+            .mediaPlayGestureAccess(true)
+            .mixedMode(MixedMode.Compatible)
+            .darkMode(this.webDark === 'dark' ? WebDarkMode.On : WebDarkMode.Auto)
+            .forceDarkAccess(this.webDark === 'dark')
+            .javaScriptOnDocumentStart([{ script: WEB_CHROME_SCRIPT, scriptRules: ['*'] }])
+            .backgroundColor($r('app.color.panel_bg'))
+            .width('100%')
+            .height('100%')
+
+          // 浮层返回键：站点详情页返回键在独立历史栈里可能失效，提供可靠出口
+          Button() {
+            Text('←')
+              .fontSize(20)
+              .fontColor(Color.White)
+          }
+          .type(ButtonType.Circle)
+          .width(40)
+          .height(40)
+          .backgroundColor('#59000000')
+          .margin({ top: this.statusVp + 12, left: 12 })
+          .onClick(() => {
+            this.closeDetailOverlay();
+          })
+        }
+        .width('100%')
+        .height('100%')
+        .alignContent(Alignment.TopStart)
+      }
 
       //弹窗
       Column() {
@@ -922,7 +1016,7 @@ struct Index {
             .height(30)
 
           Row() {
-            Text("Version:1.1.0")
+            Text("Version:1.1.1")
               .fontColor($r('app.color.dialog_text_secondary'))
               .width('100%')
               .textAlign(TextAlign.Center)
@@ -1077,6 +1171,11 @@ struct Index {
   }
 
   onBackPress() {
+    // 详情浮层打开时：系统侧滑返回=关闭浮层（底层页面不重载）
+    if (this.detailVisible) {
+      this.closeDetailOverlay();
+      return true;
+    }
     // 当前页面是否可前进或者后退给定的step步(-1),正数代表前进，负数代表后退
     if (this.controller.accessStep(-1)) {
       this.controller.backward(); // 返回上一个web页
@@ -1133,6 +1232,48 @@ struct Index {
     this.isRefreshing = true;
     this.refreshing = true;
     this.controller.stop();
+  }
+
+  /** 详情页判定：路径含 /detail（/image/detail、/imgColorExtract/detail 等） */
+  private isDetailUrl(url: string): boolean {
+    try {
+      const p = url.indexOf('/', url.indexOf('//') + 2);
+      const path = p >= 0 ? url.substring(p) : '';
+      return path.indexOf('/detail') >= 0;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /** 首页路由判定：路径以 /image/feature 开头（含同路径带 query/hash） */
+  private isHomePathUrl(url: string): boolean {
+    try {
+      const p = url.indexOf('/', url.indexOf('//') + 2);
+      const path = p >= 0 ? url.substring(p) : '/';
+      return path.split('?')[0].split('#')[0].indexOf('/image/feature') === 0;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /** 打开详情浮层：详情在独立 Web 实例中加载，底层页面保持挂载 */
+  openDetailOverlay(url: string) {
+    this.detailUrl = url;
+    this.detailVisible = true;
+  }
+
+  /** 关闭详情浮层：销毁浮层 Web，底层首页/搜索页保持挂载原状（不重载、滚动位置不变） */
+  closeDetailOverlay() {
+    if (!this.detailVisible) {
+      return;
+    }
+    this.detailVisible = false;
+    this.detailUrl = '';
+    // 浮层期间系统栏颜色可能被详情页采样覆盖：让底层页面重报一次主题色
+    try {
+      this.controller.runJavaScript('window.__stqScheduleTheme && window.__stqScheduleTheme()');
+    } catch (err) {
+    }
   }
 
   // 返回首页
