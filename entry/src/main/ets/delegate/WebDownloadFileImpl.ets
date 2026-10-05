@@ -72,6 +72,11 @@ export class WebDownloadFileHelper extends IAbstractDownloadHandler {
     WebDownloadFileHelper._webDownloadItem = this.webDownloadItem
   }
 
+  /** 图片改走图库时关闭下载确认弹窗（由宿主页负责后续提示） */
+  protected closeDownloadPopup(): void {
+    WebDownloadFileHelper.closeDownloadPopUpWindow()
+  }
+
   protected handleProgressUpdate(progress: number): void {
     WebDownloadFileHelper._downloadProgress = progress
     EmitterUtil.post<number>(EventIdConstants.DOWNLOAD_PROGRESS_EVENT_ID, progress)

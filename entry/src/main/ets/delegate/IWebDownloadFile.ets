@@ -19,9 +19,19 @@ export abstract class IAbstractDownloadHandler {
   protected isCustomPath: boolean = false
   /**
    * 图片类下载拦截回调（宿主页注入）：命中时不再走"另存到文件管理"链路，
-   * 由宿主页改走图库保存（取图字节 → 创建对话框/安全控件直写相册）。
+   * 由宿主页改走图库保存（取图字节 → 创建对话框直写相册）。
    */
   public onImageDownload: ((url: string) => void) | null = null
+  /**
+   * 下载完成兜底回调：下载内容经魔数嗅探确为图片时触发，宿主页将原始字节
+   * 直写图库（跳过 DocumentViewPicker，绝不落文件管理）。
+   */
+  public onImageDataDownload: ((data: ArrayBuffer, suggestedName: string) => void) | null = null
+  /**
+   * WebView 取图下载（downloadViaWeb）进行中置 true：onBeforeDownload 不做拦截、
+   * 不弹下载确认框，交给其专属委托处理，避免拦截回环。
+   */
+  public suppressImageIntercept: boolean = false
 
   /**
    * 设置下载委托
@@ -167,21 +177,76 @@ export abstract class IAbstractDownloadHandler {
     }
   }
 
-  /** 图片下载判定：MIME 以 image/ 开头，或 URL 去参数后以常见图片扩展名结尾 */
+  /** 图片下载判定：MIME 为 image/*，或 URL/建议文件名带图片扩展名，
+   * 或 URL 末段无扩展名（花瓣等图床 CDN 直链形如 xxx_fw658webp）——
+   * 无扩展名情形由宿主页再做魔数校验，非图片会提示而非误存。 */
   private static isImageDownload(item: webview.WebDownloadItem): boolean {
+    let mime: string = '';
     try {
-      const mime: string = (item.getMimeType() || '').toLowerCase();
+      mime = (item.getMimeType() || '').toLowerCase();
       if (mime.indexOf('image/') === 0) {
         return true;
       }
     } catch (err) {
     }
+    let url: string = '';
     try {
-      const url: string = (item.getUrl() || '').split('?')[0].toLowerCase();
-      return /\.(jpe?g|png|gif|webp|bmp|heic)$/.test(url);
+      url = (item.getUrl() || '').split('?')[0].toLowerCase();
     } catch (err) {
+    }
+    let name: string = '';
+    try {
+      name = (item.getSuggestedFileName() || '').toLowerCase();
+    } catch (err) {
+    }
+    const extRe: RegExp = /\.(jpe?g|png|gif|webp|bmp|heic)$/;
+    if (extRe.test(url) || extRe.test(name)) {
+      return true;
+    }
+    // 无扩展名 URL（图床直链）：按疑似图片拦截，宿主页魔数校验兜底
+    const seg: string = url.substring(url.lastIndexOf('/') + 1);
+    if (seg.length > 0 && seg.indexOf('.') < 0 && mime.indexOf('text/') !== 0) {
+      return true;
+    }
+    return false;
+  }
+
+  /** 读取已下载文件全部字节；失败返回 null */
+  private static readFileBytes(path: string): ArrayBuffer | null {
+    try {
+      const f = fileIo.openSync(path, fileIo.OpenMode.READ_ONLY);
+      const st = fileIo.statSync(f.fd);
+      const buf = new ArrayBuffer(st.size);
+      fileIo.readSync(f.fd, buf);
+      fileIo.closeSync(f);
+      return buf;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /** 魔数判定真实图片内容（jpg/png/gif/webp/bmp），不依赖 URL 与 MIME */
+  private static isImageMagic(u: Uint8Array): boolean {
+    if (!u || u.length < 12) {
       return false;
     }
+    if (u[0] === 0xFF && u[1] === 0xD8 && u[2] === 0xFF) {
+      return true; // jpeg
+    }
+    if (u[0] === 0x89 && u[1] === 0x50 && u[2] === 0x4E && u[3] === 0x47) {
+      return true; // png
+    }
+    if (u[0] === 0x47 && u[1] === 0x49 && u[2] === 0x46) {
+      return true; // gif
+    }
+    if (u[0] === 0x42 && u[1] === 0x4D) {
+      return true; // bmp
+    }
+    if (u[0] === 0x52 && u[1] === 0x49 && u[2] === 0x46 && u[3] === 0x46 &&
+      u[8] === 0x57 && u[9] === 0x45 && u[10] === 0x42 && u[11] === 0x50) {
+      return true; // webp
+    }
+    return false;
   }
 
   /**
@@ -189,8 +254,12 @@ export abstract class IAbstractDownloadHandler {
    * */
   private setupDelegateCallbacks(delegate: webview.WebDownloadDelegate) {
     delegate.onBeforeDownload((item: webview.WebDownloadItem) => {
-      // 图片类下载（站点内建保存按钮/MIME 为 image 或 URL 带图片扩展名）拦截改走图库：
-      // 取消下载任务并交给宿主页的图库保存链路，绝不落文件管理
+      // WebView 取图下载（downloadViaWeb）进行中：交给其专属委托，不拦截不弹框
+      if (this.suppressImageIntercept) {
+        return;
+      }
+      // 图片类下载（站点内建保存按钮/MIME 为 image、URL 或建议文件名带图片扩展名、
+      // 或无扩展名图床直链）拦截改走图库：取消下载任务并交给宿主页图库保存链路
       if (this.onImageDownload && IAbstractDownloadHandler.isImageDownload(item)) {
         const url: string = item.getUrl() || '';
         try {
@@ -218,6 +287,18 @@ export abstract class IAbstractDownloadHandler {
     delegate.onDownloadFinish(async (item: webview.WebDownloadItem) => {
       try {
         const filePath = item.getFullPath()
+        if (this.onImageDataDownload && !this.isCustomPath) {
+          // 魔数嗅探兜底：下载内容实为图片 → 原始字节交宿主页直写图库，
+          // 跳过 DocumentViewPicker，绝不落文件管理
+          const buf: ArrayBuffer | null = IAbstractDownloadHandler.readFileBytes(filePath);
+          if (buf && IAbstractDownloadHandler.isImageMagic(new Uint8Array(buf))) {
+            const name: string = item.getSuggestedFileName() || '';
+            this.closeDownloadPopup();
+            this.cleanupDownloadSession();
+            this.onImageDataDownload(buf, name);
+            return;
+          }
+        }
         if (!this.isCustomPath) {
           await this.saveFile(filePath) // 仅非自定义路径需要另存操作
         }
@@ -226,6 +307,10 @@ export abstract class IAbstractDownloadHandler {
         this.handleDownloadFailure(this.isCustomPath ? '文件下载失败' : '文件保存失败')
       }
     })
+  }
+
+  /** 下载会话善后（子类可覆盖）：默认仅清状态 */
+  protected closeDownloadPopup(): void {
   }
 
   /**

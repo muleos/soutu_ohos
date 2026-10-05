@@ -169,6 +169,8 @@ struct Index {
   @State ctxX: number = 0;
   @State ctxY: number = 0;
   @State ctxItems: string[] = [];
+  // 防回环：同一 URL 的图库保存进行中标记
+  private saveInFlightUrl: string = '';
   private ctxUrl: string = '';
 
 
@@ -553,6 +555,10 @@ struct Index {
                 this.webDownloadFile.onImageDownload = (u: string): void => {
                   this.saveWebImage(u);
                 };
+                // 下载完成魔数嗅探兜底：内容实为图片 → 原始字节直写图库，绝不进文件选择器
+                this.webDownloadFile.onImageDataDownload = (data: ArrayBuffer, name: string): void => {
+                  this.saveWebImageData(data, name);
+                };
                 if (this.shouldClearCache) {
                   this.shouldClearCache = false;
                   try {
@@ -761,6 +767,9 @@ struct Index {
               // 同主 Web：详情页内的图片类下载也改走图库保存
               this.detailDownloadFile.onImageDownload = (u: string): void => {
                 this.saveWebImage(u);
+              };
+              this.detailDownloadFile.onImageDataDownload = (data: ArrayBuffer, name: string): void => {
+                this.saveWebImageData(data, name);
               };
               try {
                 this.detailController.setCustomUserAgent(this.getuseragentbytype(this.ua_type));
@@ -1855,10 +1864,12 @@ struct Index {
   private downloadViaWeb(url: string): Promise<ArrayBuffer> {
     return new Promise<ArrayBuffer>((resolve, reject) => {
       const delegate = new webview.WebDownloadDelegate();
+      const handler = this.detailVisible ? this.detailDownloadFile : this.webDownloadFile;
       let settled: boolean = false;
       const finish = (fn: () => void): void => {
         if (!settled) {
           settled = true;
+          handler.suppressImageIntercept = false;
           fn();
         }
       };
@@ -1885,6 +1896,9 @@ struct Index {
       });
       try {
         webview.WebDownloadManager.setDownloadDelegate(delegate);
+        // 取图下载进行中：暂停下载拦截（避免拦截回调回环触发 saveWebImage）
+        this.webDownloadFile.suppressImageIntercept = true;
+        this.detailDownloadFile.suppressImageIntercept = true;
         const ctl: webview.WebviewController =
           this.detailVisible ? this.detailController : this.controller;
         ctl.startDownload(url);
@@ -1900,21 +1914,43 @@ struct Index {
   }
 
   /**
-   * 长按保存图片（aira 同构）：统一取图 → 沙箱缓存 → 系统创建相册对话框确认 →
-   * 原始字节直写图库。一步到位，无其它选择器，绝不落文件管理。
+   * 长按保存图片（aira 同构）：统一取图 → 魔数校验 → 沙箱缓存 → 系统创建相册
+   * 对话框确认 → 原始字节直写图库。一步到位，无其它选择器，绝不落文件管理。
    */
   private async saveWebImage(url: string): Promise<void> {
-    let data: ArrayBuffer | null = null;
-    try {
-      data = await this.getWebImageBytes(url);
-    } catch (err) {
-      const be = err as BusinessError;
-      const msg: string = (be && be.message) ? be.message : '图片无法获取';
-      hilog.error(0x0000, TAG, 'save fetch failed: %{public}s', msg);
-      promptAction.showToast({ message: '保存失败：' + msg });
+    // 同一 URL 保存进行中：直接跳过（防下载拦截回调回环）
+    if (url && url === this.saveInFlightUrl) {
       return;
     }
-    const ext: string = WebImageSaver.sniffExtension(data, url);
+    this.saveInFlightUrl = url;
+    try {
+      let data: ArrayBuffer | null = null;
+      try {
+        data = await this.getWebImageBytes(url);
+      } catch (err) {
+        const be = err as BusinessError;
+        const msg: string = (be && be.message) ? be.message : '图片无法获取';
+        hilog.error(0x0000, TAG, 'save fetch failed: %{public}s', msg);
+        promptAction.showToast({ message: '保存失败：' + msg });
+        return;
+      }
+      if (!data || !WebImageSaver.isLikelyImage(data)) {
+        hilog.warn(0x0000, TAG, 'save skip: not image content, url=%{public}s', url.substring(0, 120));
+        promptAction.showToast({ message: '该链接不是图片文件' });
+        return;
+      }
+      await this.saveWebImageData(data, url);
+    } finally {
+      this.saveInFlightUrl = '';
+    }
+  }
+
+  /**
+   * 原始图片字节落图库：沙箱缓存 → 系统创建相册对话框确认 → 原始字节直写图库。
+   * 长按保存与下载兜底共用，全链路无文件选择器。
+   */
+  private async saveWebImageData(data: ArrayBuffer, urlOrName: string): Promise<void> {
+    const ext: string = WebImageSaver.sniffExtension(data, urlOrName);
     let cachePath: string = '';
     try {
       cachePath = await WebImageSaver.writeToCacheFile(context_index, data, ext);
