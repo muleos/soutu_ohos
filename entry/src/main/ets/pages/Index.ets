@@ -1,7 +1,7 @@
 import { webview } from '@kit.ArkWeb';
 import { promptAction, window, display, mediaquery } from '@kit.ArkUI';
 import { common, Want, OpenLinkOptions, ConfigurationConstant } from '@kit.AbilityKit';
-import { fileIo } from '@kit.CoreFileKit';
+import { fileIo, fileUri } from '@kit.CoreFileKit';
 import {
   saveHomeUrl,
   getHomeUrl,
@@ -171,6 +171,11 @@ struct Index {
   @State ctxItems: string[] = [];
   // 防回环：同一 URL 的图库保存进行中标记
   private saveInFlightUrl: string = '';
+  // 保存到图库确认弹窗：内嵌系统安全控件 SaveButton，点击后临时授权直写图库
+  @State saveBtnVisible: boolean = false;
+  private pendingSaveBytes: ArrayBuffer = new ArrayBuffer(0);
+  private pendingSaveExt: string = '';
+  private pendingSavePath: string = '';
   private ctxUrl: string = '';
 
 
@@ -833,20 +838,7 @@ struct Index {
             .width('100%')
             .height('100%')
 
-          // 浮层返回键：站点详情页返回键在独立历史栈里可能失效，提供可靠出口
-          Button() {
-            Text('←')
-              .fontSize(20)
-              .fontColor(Color.White)
-          }
-          .type(ButtonType.Circle)
-          .width(40)
-          .height(40)
-          .backgroundColor('#59000000')
-          .margin({ top: this.statusVp + 12, left: 12 })
-          .onClick(() => {
-            this.closeDetailOverlay();
-          })
+          // 浮层返回键已移除：系统侧滑返回/onBackPress 仍可关闭浮层
         }
         .width('100%')
         .height('100%')
@@ -1378,6 +1370,57 @@ struct Index {
         .position({ x: this.ctxX, y: this.ctxY })
       }
 
+      // 保存到图库确认弹窗：内嵌系统安全控件 SaveButton（官方样式"保存"按钮），
+      // 点击后免权限临时授权、原始字节直写相册；绝不回退文件选择器
+      if (this.saveBtnVisible) {
+        Stack() {
+          Column()
+            .width('100%')
+            .height('100%')
+            .backgroundColor('#66000000')
+            .onClick((): void => {
+              this.closeSaveDialog();
+            })
+          Column({ space: 14 }) {
+            Text('保存图片到图库')
+              .fontSize(16)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.dialog_text'))
+            Image(fileUri.getUriFromPath(this.pendingSavePath))
+              .height(180)
+              .objectFit(ImageFit.Contain)
+              .borderRadius(8)
+              .backgroundColor($r('app.color.ctx_menu_bg'))
+            Text(this.pendingSaveExt.toUpperCase() + ' · 原始字节无损写入相册')
+              .fontSize(12)
+              .fontColor($r('app.color.dialog_text'))
+              .opacity(0.6)
+            SaveButton({ icon: SaveIconStyle.FULL_FILLED, text: SaveDescription.SAVE_IMAGE, buttonType: ButtonType.Capsule })
+              .onClick((event: ClickEvent, result: SaveButtonOnClickResult): void => {
+                if (result === SaveButtonOnClickResult.SUCCESS) {
+                  this.doSecureSave();
+                } else if (result === SaveButtonOnClickResult.TEMPORARY_AUTHORIZATION_FAILED) {
+                  promptAction.showToast({ message: '临时授权失败，请重试' });
+                }
+              })
+            Text('取消')
+              .fontSize(14)
+              .fontColor($r('app.color.dialog_text'))
+              .opacity(0.7)
+              .padding({ left: 24, right: 24, top: 4, bottom: 4 })
+              .onClick((): void => {
+                this.closeSaveDialog();
+              })
+          }
+          .alignItems(HorizontalAlign.Center)
+          .padding(24)
+          .borderRadius(16)
+          .backgroundColor($r('app.color.panel_bg'))
+        }
+        .width('100%')
+        .height('100%')
+      }
+
     }
     .height('100%')
     .width('100%')
@@ -1385,6 +1428,11 @@ struct Index {
   }
 
   onBackPress() {
+    // 保存确认弹窗打开时：返回键取消保存
+    if (this.saveBtnVisible) {
+      this.closeSaveDialog();
+      return true;
+    }
     // 详情浮层打开时：系统侧滑返回=关闭浮层（底层页面不重载）
     if (this.detailVisible) {
       this.closeDetailOverlay();
@@ -1924,6 +1972,7 @@ struct Index {
     }
     this.saveInFlightUrl = url;
     try {
+      promptAction.showToast({ message: '正在获取图片…', duration: 1500 });
       let data: ArrayBuffer | null = null;
       try {
         data = await this.getWebImageBytes(url);
@@ -1946,8 +1995,9 @@ struct Index {
   }
 
   /**
-   * 原始图片字节落图库：沙箱缓存 → 系统创建相册对话框确认 → 原始字节直写图库。
-   * 长按保存与下载兜底共用，全链路无文件选择器。
+   * 原始图片字节落图库：写沙箱缓存（预览用）→ 弹出确认弹窗，内嵌系统安全控件
+   * SaveButton —— 用户点系统保存按钮后免权限临时授权，createAsset 原始字节直写
+   * 图库。长按保存与下载兜底共用，全链路无文件选择器，绝不落文件管理。
    */
   private async saveWebImageData(data: ArrayBuffer, urlOrName: string): Promise<void> {
     const ext: string = WebImageSaver.sniffExtension(data, urlOrName);
@@ -1958,21 +2008,38 @@ struct Index {
       promptAction.showToast({ message: '保存失败：缓存写入异常' });
       return;
     }
+    this.pendingSaveBytes = data;
+    this.pendingSaveExt = ext;
+    this.pendingSavePath = cachePath;
+    this.saveBtnVisible = true;
+  }
+
+  private closeSaveDialog(): void {
+    this.saveBtnVisible = false;
+    this.cleanupSaveCache(this.pendingSavePath);
+    this.pendingSaveBytes = new ArrayBuffer(0);
+    this.pendingSaveExt = '';
+    this.pendingSavePath = '';
+  }
+
+  /** 系统安全控件 SaveButton 点击回调内执行：临时授权窗口内 createAsset 直写图库 */
+  private async doSecureSave(): Promise<void> {
+    const data: ArrayBuffer = this.pendingSaveBytes;
+    const ext: string = this.pendingSaveExt;
+    if (!data || data.byteLength === 0) {
+      this.closeSaveDialog();
+      return;
+    }
     try {
-      const r: string =
-        await WebImageSaver.saveViaCreationDialog(context_index, cachePath, data, ext);
-      if (r === 'saved') {
-        promptAction.showToast({ message: '已保存到图库' });
-      } else {
-        promptAction.showToast({ message: '已取消保存' });
-      }
+      await WebImageSaver.saveViaSecurityButton(context_index, data, ext);
+      promptAction.showToast({ message: '已保存到图库' });
     } catch (err) {
-      const de = err as BusinessError;
-      hilog.error(0x0000, TAG, 'save creation dialog failed %{public}d: %{public}s',
-        de.code ?? 0, (de && de.message) ? de.message : '?');
-      promptAction.showToast({ message: '保存失败：' + ((de && de.message) ? de.message : '写入图库异常') });
+      const be = err as BusinessError;
+      const msg: string = (be && be.message) ? be.message : '未知错误';
+      hilog.error(0x0000, TAG, 'secure save failed: %{public}s', msg);
+      promptAction.showToast({ message: '保存失败：' + msg });
     } finally {
-      this.cleanupSaveCache(cachePath);
+      this.closeSaveDialog();
     }
   }
 

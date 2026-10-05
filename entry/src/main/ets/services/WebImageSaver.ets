@@ -165,6 +165,25 @@ export class WebImageSaver {
     return 'cancel';
   }
 
+  /**
+   * 安全控件临时授权直写图库 —— 必须在 SaveButton onClick 回调内调用
+   * （点击后约 10s 临时授权窗口内 createAsset 免权限，无任何二次弹窗，直接入库）。
+   * 这是长按保存的确定性通道：不依赖 showAssetsCreationDialog 的设备可用性。
+   */
+  static async saveViaSecurityButton(context: common.UIAbilityContext,
+    data: ArrayBuffer, ext: string): Promise<void> {
+    if (!data || data.byteLength === 0) {
+      throw new Error('图片内容为空');
+    }
+    const helper: photoAccessHelper.PhotoAccessHelper =
+      photoAccessHelper.getPhotoAccessHelper(context);
+    const uri: string = await helper.createAsset(photoAccessHelper.PhotoType.IMAGE, ext);
+    const targetFile = fileIo.openSync(uri, fileIo.OpenMode.READ_WRITE);
+    fileIo.writeSync(targetFile.fd, new Uint8Array(data));
+    fileIo.closeSync(targetFile);
+    hilog.info(0x0000, TAG, 'saved via security button: %{public}s', uri);
+  }
+
   /** 复制文本（图片链接/视频链接） */
   static copyText(text: string, tip: string): void {
     try {
