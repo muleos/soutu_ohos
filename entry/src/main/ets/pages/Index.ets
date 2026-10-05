@@ -1,7 +1,7 @@
 import { webview } from '@kit.ArkWeb';
 import { promptAction, window, display, mediaquery } from '@kit.ArkUI';
 import { common, Want, OpenLinkOptions, ConfigurationConstant } from '@kit.AbilityKit';
-import { fileIo } from '@kit.CoreFileKit';
+import { fileIo, fileUri } from '@kit.CoreFileKit';
 import {
   saveHomeUrl,
   getHomeUrl,
@@ -27,6 +27,7 @@ import {
   getBottomLift
 } from '../model/StorageService';
 import { DownloadConfirmDialog } from '../component/DownloadConfirmDialog'
+import { ImageViewerOverlay } from '../component/ImageViewerOverlay'
 import { IAbstractDownloadHandler } from '../delegate/IWebDownloadFile'
 import { WebDownloadFileHelper } from '../delegate/WebDownloadFileImpl'
 import { EmitterUtil } from '../utiles/EmitterUtil'
@@ -169,6 +170,14 @@ struct Index {
   @State ctxX: number = 0;
   @State ctxY: number = 0;
   @State ctxItems: string[] = [];
+  // 图片大图查看浮层（VHome 同款手势：双指捏合/双击放大/平移）
+  @State viewerVisible: boolean = false;
+  private viewerUrl: string = '';
+  // 保存到图库安全控件确认弹窗（创建对话框不可用时的回退通道，绝不落文件管理）
+  @State saveBtnVisible: boolean = false;
+  private pendingSaveBytes: ArrayBuffer = new ArrayBuffer(0);
+  private pendingSaveExt: string = '';
+  private pendingSavePath: string = '';
   private ctxUrl: string = '';
 
 
@@ -829,6 +838,26 @@ struct Index {
         .alignContent(Alignment.TopStart)
       }
 
+      // 图片大图查看浮层（VHome 同款：双指捏合/双击放大/平移，黑底全屏）
+      if (this.viewerVisible) {
+        ImageViewerOverlay({
+          viewerUrl: this.viewerUrl,
+          topInset: this.statusVp,
+          onClose: (): void => {
+            this.viewerVisible = false;
+          },
+          onLongPress: (u: string): void => {
+            // 长按唤出操作菜单（渲染层级高于查看器，浮出可见）；
+            // 菜单作用于当前显示分辨率的 URL（保存/复制/分享拿到的是看到的那张）
+            this.ctxUrl = u;
+            this.ctxItems = ['保存图片', '复制图片', '分享图片', '复制图片链接'];
+            this.ctxX = 24;
+            this.ctxY = this.statusVp + 64;
+            this.ctxVisible = true;
+          }
+        })
+      }
+
       //弹窗
       Column() {
         Column() {
@@ -1354,6 +1383,57 @@ struct Index {
         .position({ x: this.ctxX, y: this.ctxY })
       }
 
+      // 保存到图库安全控件确认弹窗：SaveButton 临时授权（免权限）直写图库，
+      // 仅在创建对话框不可用时出现；绝不回退文件选择器（保存一律以图片形式入库）
+      if (this.saveBtnVisible) {
+        Stack() {
+          Column()
+            .width('100%')
+            .height('100%')
+            .backgroundColor('#66000000')
+            .onClick((): void => {
+              this.closeSaveDialog();
+            })
+          Column({ space: 14 }) {
+            Text('保存图片到图库')
+              .fontSize(16)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.dialog_text'))
+            Image(fileUri.getUriFromPath(this.pendingSavePath))
+              .height(180)
+              .objectFit(ImageFit.Contain)
+              .borderRadius(8)
+              .backgroundColor($r('app.color.ctx_menu_bg'))
+            Text(this.pendingSaveExt.toUpperCase() + ' · 原始字节无损写入相册')
+              .fontSize(12)
+              .fontColor($r('app.color.dialog_text'))
+              .opacity(0.6)
+            SaveButton({ icon: SaveIconStyle.FULL_FILLED, text: SaveDescription.SAVE_IMAGE, buttonType: ButtonType.Capsule })
+              .onClick((event: ClickEvent, result: SaveButtonOnClickResult): void => {
+                if (result === SaveButtonOnClickResult.SUCCESS) {
+                  this.doSecureSave();
+                } else if (result === SaveButtonOnClickResult.TEMPORARY_AUTHORIZATION_FAILED) {
+                  promptAction.showToast({ message: '临时授权失败，请重试' });
+                }
+              })
+            Text('取消')
+              .fontSize(14)
+              .fontColor($r('app.color.dialog_text'))
+              .opacity(0.7)
+              .padding({ left: 24, right: 24, top: 4, bottom: 4 })
+              .onClick((): void => {
+                this.closeSaveDialog();
+              })
+          }
+          .alignItems(HorizontalAlign.Center)
+          .padding(24)
+          .borderRadius(16)
+          .backgroundColor($r('app.color.panel_bg'))
+        }
+        .width('100%')
+        .height('100%')
+      }
+
     }
     .height('100%')
     .width('100%')
@@ -1361,6 +1441,16 @@ struct Index {
   }
 
   onBackPress() {
+    // 大图查看浮层打开时：返回键优先关闭浮层
+    if (this.viewerVisible) {
+      this.viewerVisible = false;
+      return true;
+    }
+    // 安全控件保存弹窗打开时：返回键取消保存
+    if (this.saveBtnVisible) {
+      this.closeSaveDialog();
+      return true;
+    }
     // 详情浮层打开时：系统侧滑返回=关闭浮层（底层页面不重载）
     if (this.detailVisible) {
       this.closeDetailOverlay();
@@ -1657,7 +1747,7 @@ struct Index {
       }
       this.ctxUrl = sourceUrl;
       if (mediaType === 1) {
-        this.ctxItems = ['保存图片', '复制图片', '分享图片', '复制图片链接'];
+        this.ctxItems = ['查看大图', '保存图片', '复制图片', '分享图片', '复制图片链接'];
       } else {
         this.ctxItems = ['复制视频链接', '其他应用打开'];
       }
@@ -1884,16 +1974,90 @@ struct Index {
     });
   }
 
-  /** 长按保存图片：统一取图 → 字节落图库（弹窗/选择器双通道） */
+  /**
+   * 长按保存图片：统一取图 → 创建对话框落图库；对话框不可用时打开安全控件确认
+   * 弹窗（SaveButton 临时授权直写图库）。保存一律以图片形式入图库，绝不落文件管理。
+   */
   private async saveWebImage(url: string): Promise<void> {
+    let data: ArrayBuffer | null = null;
     try {
-      const data: ArrayBuffer = await this.getWebImageBytes(url);
-      await WebImageSaver.saveImageBytes(context_index, data, url);
+      data = await this.getWebImageBytes(url);
+    } catch (err) {
+      const be = err as BusinessError;
+      const msg: string = (be && be.message) ? be.message : '图片无法获取';
+      hilog.error(0x0000, TAG, 'save fetch failed: %{public}s', msg);
+      promptAction.showToast({ message: '保存失败：' + msg });
+      return;
+    }
+    const ext: string = WebImageSaver.sniffExtension(data, url);
+    let cachePath: string = '';
+    try {
+      cachePath = await WebImageSaver.writeToCacheFile(context_index, data, ext);
+    } catch (err) {
+      promptAction.showToast({ message: '保存失败：缓存写入异常' });
+      return;
+    }
+    let r: string = 'fallback';
+    try {
+      r = await WebImageSaver.saveViaCreationDialog(context_index, cachePath, data, ext);
+    } catch (err) {
+      const de = err as BusinessError;
+      hilog.warn(0x0000, TAG, 'creation dialog unavailable: %{public}s，回退安全控件',
+        (de && de.message) ? de.message : '?');
+    }
+    if (r === 'saved') {
+      promptAction.showToast({ message: '已保存到图库' });
+      this.cleanupSaveCache(cachePath);
+      return;
+    }
+    if (r === 'cancel') {
+      promptAction.showToast({ message: '已取消保存' });
+      this.cleanupSaveCache(cachePath);
+      return;
+    }
+    // 创建对话框不可用：打开安全控件确认弹窗（用户点 SaveButton 后临时授权直写图库）
+    this.pendingSaveBytes = data;
+    this.pendingSaveExt = ext;
+    this.pendingSavePath = cachePath;
+    this.saveBtnVisible = true;
+  }
+
+  private cleanupSaveCache(path: string): void {
+    if (!path || path.length === 0) {
+      return;
+    }
+    try {
+      fileIo.unlinkSync(path);
+    } catch (err) {
+    }
+  }
+
+  private closeSaveDialog(): void {
+    this.saveBtnVisible = false;
+    this.cleanupSaveCache(this.pendingSavePath);
+    this.pendingSaveBytes = new ArrayBuffer(0);
+    this.pendingSaveExt = '';
+    this.pendingSavePath = '';
+  }
+
+  /** 安全控件 SaveButton 点击回调内执行：临时授权窗口内 createAsset 直写图库 */
+  private async doSecureSave(): Promise<void> {
+    const data: ArrayBuffer = this.pendingSaveBytes;
+    const ext: string = this.pendingSaveExt;
+    if (!data || data.byteLength === 0) {
+      this.closeSaveDialog();
+      return;
+    }
+    try {
+      await WebImageSaver.saveViaSecurityButton(context_index, data, ext);
+      promptAction.showToast({ message: '已保存到图库' });
     } catch (err) {
       const be = err as BusinessError;
       const msg: string = (be && be.message) ? be.message : '未知错误';
-      hilog.error(0x0000, TAG, 'save failed: %{public}s', msg);
+      hilog.error(0x0000, TAG, 'secure save failed: %{public}s', msg);
       promptAction.showToast({ message: '保存失败：' + msg });
+    } finally {
+      this.closeSaveDialog();
     }
   }
 
@@ -1927,7 +2091,10 @@ struct Index {
   onCtxItem(item: string): void {
     this.ctxVisible = false;
     const url = this.ctxUrl;
-    if (item === '保存图片') {
+    if (item === '查看大图') {
+      this.viewerUrl = url;
+      this.viewerVisible = true;
+    } else if (item === '保存图片') {
       this.saveWebImage(url);
     } else if (item === '复制图片') {
       this.copyWebImage(url);

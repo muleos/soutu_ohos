@@ -5,13 +5,13 @@
  * 两段式 API（v1.1.3 重构）：
  *  - fetchImageEx：原生取图，Referer 多策略重试（页面 URL → 空 → 图片自身 origin），
  *    覆盖常见防盗链配置（只允许同域 Referer 或允许空 Referer 的源站）
- *  - saveImageBytes：字节落图库（安全控件弹窗优先，失败回退系统保存选择器）
+ *  - saveImageBytes：字节落图库（创建对话框优先，不可用回退安全控件 SaveButton
+ *    临时授权直写图库；文件选择器已废弃——保存一律以图片形式入图库，绝不落文件管理）
  * 全链路 hilog 诊断（TAG: web-savePic），真机排查用 `hdc shell hilog | grep web-savePic`
  */
 import { http } from '@kit.NetworkKit';
 import { fileIo, fileUri } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
-import { picker } from '@kit.CoreFileKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { common } from '@kit.AbilityKit';
@@ -134,9 +134,58 @@ export class WebImageSaver {
     return false;
   }
 
+  /** 公开缓存写入：UI 层预览 + 双通道保存共用的沙箱缓存文件 */
+  static async writeToCacheFile(context: common.UIAbilityContext,
+    data: ArrayBuffer, ext: string): Promise<string> {
+    return WebImageSaver.writeToCache(context, data, ext);
+  }
+
   /**
-   * 字节落图库：安全控件创建弹窗（免权限）优先；失败/取消回退系统保存选择器。
-   * 抛出异常时由调用方负责提示（saveToGallery 包装器除外）。
+   * 通道一：系统「创建相册资产」对话框（免权限，返回相册 URI 后原始字节写入）。
+   * 返回 'saved'（已入库）/ 'cancel'（用户取消）；对话框不可用时抛错，由调用方回退安全控件。
+   */
+  static async saveViaCreationDialog(context: common.UIAbilityContext, cachePath: string,
+    data: ArrayBuffer, ext: string): Promise<string> {
+    const helper: photoAccessHelper.PhotoAccessHelper =
+      photoAccessHelper.getPhotoAccessHelper(context);
+    const config: photoAccessHelper.PhotoCreationConfig = {
+      title: 'Soutu_' + Date.now(),
+      fileNameExtension: ext,
+      photoType: photoAccessHelper.PhotoType.IMAGE
+    };
+    const created: string[] =
+      await helper.showAssetsCreationDialog([fileUri.getUriFromPath(cachePath)], [config]);
+    if (created && created.length > 0) {
+      const targetFile = fileIo.openSync(created[0], fileIo.OpenMode.READ_WRITE);
+      fileIo.writeSync(targetFile.fd, new Uint8Array(data));
+      fileIo.closeSync(targetFile);
+      hilog.info(0x0000, TAG, 'saved via creation dialog: %{public}s', created[0]);
+      return 'saved';
+    }
+    return 'cancel';
+  }
+
+  /**
+   * 通道二：安全控件临时授权直写图库 —— 必须在 SaveButton onClick 回调内调用
+   * （点击后约 10s 临时授权窗口内 createAsset 免权限）。绝不落文件管理。
+   */
+  static async saveViaSecurityButton(context: common.UIAbilityContext,
+    data: ArrayBuffer, ext: string): Promise<void> {
+    if (!data || data.byteLength === 0) {
+      throw new Error('图片内容为空');
+    }
+    const helper: photoAccessHelper.PhotoAccessHelper =
+      photoAccessHelper.getPhotoAccessHelper(context);
+    const uri: string = await helper.createAsset(photoAccessHelper.PhotoType.IMAGE, ext);
+    const targetFile = fileIo.openSync(uri, fileIo.OpenMode.READ_WRITE);
+    fileIo.writeSync(targetFile.fd, new Uint8Array(data));
+    fileIo.closeSync(targetFile);
+    hilog.info(0x0000, TAG, 'saved via security button: %{public}s', uri);
+  }
+
+  /**
+   * 字节落图库（兼容入口）：仅走创建对话框通道；对话框不可用抛 NEED_SECURE_BUTTON
+   * 哨兵，由 UI 层打开安全控件确认弹窗。文件选择器（落文件管理）已废弃不再回退。
    */
   static async saveImageBytes(context: common.UIAbilityContext, data: ArrayBuffer,
     url: string): Promise<void> {
@@ -145,55 +194,18 @@ export class WebImageSaver {
     }
     const ext: string = WebImageSaver.sniffExtension(data, url);
     const tempPath: string = await WebImageSaver.writeToCache(context, data, ext);
-
     try {
-      // 首选：安全控件创建对话框（免权限，写完即入图库）
-      const helper: photoAccessHelper.PhotoAccessHelper =
-        photoAccessHelper.getPhotoAccessHelper(context);
-      const assetUri: string = fileUri.getUriFromPath(tempPath);
-      const config: photoAccessHelper.PhotoCreationConfig = {
-        title: 'Soutu_' + Date.now(),
-        fileNameExtension: ext,
-        photoType: photoAccessHelper.PhotoType.IMAGE
-      };
-      const created: string[] =
-        await helper.showAssetsCreationDialog([assetUri], [config]);
-      if (created && created.length > 0) {
-        const targetUri: string = created[0];
-        const targetFile = fileIo.openSync(targetUri, fileIo.OpenMode.READ_WRITE);
-        fileIo.writeSync(targetFile.fd, new Uint8Array(data));
-        fileIo.closeSync(targetFile);
-        hilog.info(0x0000, TAG, 'saved via creation dialog: %{public}s', targetUri);
+      const r: string = await WebImageSaver.saveViaCreationDialog(context, tempPath, data, ext);
+      if (r === 'saved') {
         promptAction.showToast({ message: '已保存到图库' });
       } else {
-        hilog.info(0x0000, TAG, 'creation dialog dismissed by user');
         promptAction.showToast({ message: '已取消保存' });
       }
     } catch (dialogErr) {
       const de = dialogErr as BusinessError;
-      hilog.error(0x0000, TAG, 'creation dialog error %{public}d: %{public}s，回退保存选择器',
+      hilog.error(0x0000, TAG, 'creation dialog error %{public}d: %{public}s，需回退安全控件',
         de.code ?? 0, (de && de.message) ? de.message : '?');
-      // 回退：系统"保存图片"选择器（用户选位置后写入，同样免权限）
-      try {
-        const saveOptions = new picker.PhotoSaveOptions();
-        saveOptions.newFileNames = ['Soutu_' + Date.now() + '.' + ext];
-        const viewPicker = new picker.PhotoViewPicker();
-        const uris: Array<string> = await viewPicker.save(saveOptions);
-        if (uris && uris.length > 0) {
-          const targetFile = fileIo.openSync(uris[0], fileIo.OpenMode.READ_WRITE);
-          fileIo.writeSync(targetFile.fd, new Uint8Array(data));
-          fileIo.closeSync(targetFile);
-          hilog.info(0x0000, TAG, 'saved via picker: %{public}s', uris[0]);
-          promptAction.showToast({ message: '已保存' });
-        } else {
-          promptAction.showToast({ message: '已取消保存' });
-        }
-      } catch (pickErr) {
-        const pe = pickErr as BusinessError;
-        hilog.error(0x0000, TAG, 'picker save error %{public}d: %{public}s',
-          pe.code ?? 0, (pe && pe.message) ? pe.message : '?');
-        throw new Error((pe && pe.message) ? pe.message : '写入图库失败');
-      }
+      throw new Error('NEED_SECURE_BUTTON');
     }
   }
 
