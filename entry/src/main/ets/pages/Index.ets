@@ -601,9 +601,13 @@ struct Index {
                   }
                   // 主文档导航：按页面层级刷新状态栏避让（首页沉浸，二三级避让）
                   if ((scheme === 'http' || scheme === 'https') && event.data.isMainFrame()) {
-                    // 搜图神器适配：详情页改走浮层 Web 打开，返回时底层页面保持原状不重载
-                    if (!this.detailVisible && this.isDetailUrl(url)) {
-                      this.openDetailOverlay(url);
+                    // 搜图神器适配：详情页一律交由浮层 Web 承载，主 Web 永不加载详情——
+                    // 底层列表页保持挂载原状，关闭浮层时滚动位置与已加载数据零丢失
+                    //（兜底站点"路由中断后回退 location.href 直跳"的路径：浮层未开时先开浮层）
+                    if (this.isDetailUrl(url)) {
+                      if (!this.detailVisible) {
+                        this.openDetailOverlay(url);
+                      }
                       return true;
                     }
                     this.pageUrl = url;

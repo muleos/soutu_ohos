@@ -17,6 +17,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { common } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { util } from '@kit.ArkTS';
 
 const MAX_BYTES: number = 30 * 1024 * 1024;
 const TAG: string = 'web-savePic';
@@ -24,41 +25,106 @@ const TAG: string = 'web-savePic';
 export class WebImageSaver {
 
   /**
-   * 原生直取图片：Referer 多策略重试。
-   * 策略顺序：页面 URL（正常浏览上下文）→ 空（部分源站"允许空 Referer"）→ 图片 origin（同域 Referer 白名单）。
-   * 任一策略拿到非空 2xx 响应即返回。
+   * 原生直取图片：URL 候选 × Referer 策略 组合重试，逐次校验图片魔数。
+   *
+   * Referer 策略顺序（关键）：空 Referer 排第一 —— 搜图神器的 HTML 声明
+   * `<meta name="referrer" content="no-referrer">`，WebView 显示图片时不带 Referer；
+   * 花瓣等源站对"带非白名单 Referer"的请求一律 567/403 拒绝，空 Referer 才放行
+   * （实测：gd-hbimg.huaban.com 空 Referer 200/1.09MB，带页面 Referer 567）。
+   *
+   * URL 候选：原 URL + 花瓣 edge 域回退 —— 站点自身在 gd-hbimg-edge/gd-hbimg 两域间
+   * 改写（replaceHuabanUrlDomain/picAddWatermark），edge 域签名失效时主域往往仍可用。
    */
   static async fetchImageEx(url: string, pageReferer: string, cookie: string,
     userAgent: string): Promise<ArrayBuffer> {
-    const strategies: string[] = [];
-    if (pageReferer) {
-      strategies.push(pageReferer);
+    // data: URL 直接解码（内联图片，无网络请求）
+    if (url.trim().toLowerCase().indexOf('data:image/') === 0) {
+      const comma: number = url.indexOf(',');
+      if (comma > 0 && url.substring(0, comma).toLowerCase().indexOf('base64') >= 0) {
+        try {
+          const helper = new util.Base64Helper();
+          const u8: Uint8Array = helper.decodeSync(url.substring(comma + 1));
+          const buf: ArrayBuffer = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer;
+          if (WebImageSaver.isLikelyImage(buf)) {
+            return buf;
+          }
+        } catch (err) {
+        }
+      }
+      throw new Error('无法解析内联图片');
     }
-    strategies.push('');
+    // 1) URL 候选
+    const urls: string[] = [url];
     try {
-      const m: RegExpMatchArray | null = url.match(/^https?:\/\/[^/]+/);
-      if (m && m[0]) {
-        strategies.push(m[0] + '/');
+      const m: RegExpMatchArray | null = url.match(/^(https?:\/\/)gd-hbimg-edge\.huaban\.com\/(.+)$/);
+      if (m) {
+        urls.push(m[1] + 'gd-hbimg.huaban.com/' + m[2]);
       }
     } catch (err) {
     }
-    let lastErr: Error = new Error('未知错误');
-    for (const referer of strategies) {
-      try {
-        const data: ArrayBuffer = await WebImageSaver.fetchImage(url, referer, cookie, userAgent);
-        if (data && data.byteLength > 0) {
-          hilog.info(0x0000, TAG, 'fetch ok: %{public}d B, referer=%{public}s',
-            data.byteLength, referer === '' ? '(empty)' : referer);
-          return data;
+    // 2) Referer 候选：空 → 页面 URL → 图片 origin（去重保序）
+    const referers: string[] = [''];
+    if (pageReferer && pageReferer !== '') {
+      referers.push(pageReferer);
+    }
+    try {
+      const m2: RegExpMatchArray | null = url.match(/^https?:\/\/[^/]+/);
+      if (m2 && m2[0]) {
+        const originRef: string = m2[0] + '/';
+        if (referers.indexOf(originRef) < 0) {
+          referers.push(originRef);
         }
-      } catch (err) {
-        const be = err as BusinessError;
-        lastErr = new Error((be && be.message) ? be.message : '取图失败');
-        hilog.warn(0x0000, TAG, 'fetch fail (referer=%{public}s): %{public}s',
-          referer === '' ? '(empty)' : referer, lastErr.message);
+      }
+    } catch (err) {
+    }
+    // 3) 组合重试
+    let lastErr: Error = new Error('未知错误');
+    for (const candidate of urls) {
+      for (const referer of referers) {
+        try {
+          const data: ArrayBuffer = await WebImageSaver.fetchImage(candidate, referer, cookie, userAgent);
+          if (data && data.byteLength > 0 && WebImageSaver.isLikelyImage(data)) {
+            hilog.info(0x0000, TAG, 'fetch ok: %{public}d B, url=%{public}s, referer=%{public}s',
+              data.byteLength, candidate.substring(0, 100),
+              referer === '' ? '(empty)' : referer.substring(0, 60));
+            return data;
+          }
+          lastErr = new Error('HTTP 2xx 但非图片内容（可能为防盗链错误页）');
+        } catch (err) {
+          const be = err as BusinessError;
+          lastErr = new Error((be && be.message) ? be.message : '取图失败');
+        }
+        hilog.warn(0x0000, TAG, 'fetch fail (url=%{public}s, referer=%{public}s): %{public}s',
+          candidate.substring(0, 100), referer === '' ? '(empty)' : referer.substring(0, 60),
+          lastErr.message);
       }
     }
     throw lastErr;
+  }
+
+  /** 图片魔数校验：jpg/png/gif/webp；2xx HTML 防盗链错误页在这里被拒绝 */
+  private static isLikelyImage(data: ArrayBuffer): boolean {
+    try {
+      const bytes = new Uint8Array(data.slice(0, 12));
+      if (bytes.length < 4) {
+        return false;
+      }
+      if (bytes[0] === 0xFF && bytes[1] === 0xD8) {
+        return true;
+      }
+      if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) {
+        return true;
+      }
+      if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) {
+        return true;
+      }
+      if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 &&
+        bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42) {
+        return true;
+      }
+    } catch (err) {
+    }
+    return false;
   }
 
   /**
