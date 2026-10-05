@@ -6,21 +6,18 @@ import { webview } from '@kit.ArkWeb';
 import { preferences } from '@kit.ArkData';
 
 const DOMAIN = 0x0000;
-const DEFAULT_HOME_URL: string = 'https://soutushenqi.com/image/feature';
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
-    // WebView 内核预热 + 主页预连接：冷启动提前建立 TCP/TLS，减少首屏与重复加载耗时。
-    // 失败仅降级为普通加载，不阻塞启动
+    // 启动性能：最早时机预热 WebView 内核并预连接首页，压缩首屏白屏时间
     try {
       webview.WebviewController.initializeWebEngine();
       const pref = preferences.getPreferencesSync(this.context, { name: 'app_config' });
-      const homeUrl: string = String(pref.getSync('homepage_url', DEFAULT_HOME_URL)) || DEFAULT_HOME_URL;
-      webview.WebviewController.prepareForPageLoad(homeUrl, true, 2);
+      const home = String(pref.getSync('homepage_url', '')) || 'https://soutushenqi.com/image/feature';
+      webview.WebviewController.prepareForPageLoad(home, true, 2);
     } catch (err) {
-      hilog.error(DOMAIN, 'testTag', 'webview preheat failed: %{public}s', JSON.stringify(err));
     }
+    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
   }
 
   onDestroy(): void {

@@ -155,7 +155,8 @@ export const WEB_CHROME_SCRIPT: string = `
 
   window.addEventListener('load', function () { scheduleTheme(); });
   window.addEventListener('pageshow', function () { scheduleTheme(); });
-  setInterval(scheduleTheme, 2000);
+  // 页面不可见时跳过采样，降低后台 CPU/电量开销
+  setInterval(function () { if (!document.hidden) { scheduleTheme(); } }, 2000);
   scheduleTheme();
 })();
 //# sourceURL=stq-web-chrome.js

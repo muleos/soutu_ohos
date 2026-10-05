@@ -1,7 +1,6 @@
 import { webview } from '@kit.ArkWeb';
-import { promptAction, window, display, prompt } from '@kit.ArkUI';
+import { promptAction, window, display } from '@kit.ArkUI';
 import { common, Want, OpenLinkOptions, ConfigurationConstant } from '@kit.AbilityKit';
-import util from '@ohos.util';
 import {
   saveHomeUrl,
   getHomeUrl,
@@ -20,7 +19,9 @@ import {
   getSlidenum,
   saveSlidenum,
   saveWebDarkMode,
-  getWebDarkMode
+  getWebDarkMode,
+  saveWebCookie,
+  getWebCookie
 } from '../model/StorageService';
 import { DownloadConfirmDialog } from '../component/DownloadConfirmDialog'
 import { IAbstractDownloadHandler } from '../delegate/IWebDownloadFile'
@@ -29,11 +30,10 @@ import { EmitterUtil } from '../utiles/EmitterUtil'
 import { WEB_CHROME_SCRIPT } from '../utiles/WebChromeScript'
 import { WebImageSaver } from '../services/WebImageSaver'
 import { http } from '@kit.NetworkKit';
-import { fileIo as fs, ReadOptions, WriteOptions } from '@kit.CoreFileKit';
+import { fileIo as fs } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { BusinessError, systemDateTime } from '@kit.BasicServicesKit';
 import { preferences } from '@kit.ArkData';
-import { buffer } from '@kit.ArkTS';
 
 enum ScreenOrientation {
   PORTRAIT = display.Orientation.PORTRAIT,
@@ -51,6 +51,8 @@ const TAG = 'web-savePic';
 // UA 常量：默认伪装安卓客户端（Chrome/Android 手机 UA），电脑端为桌面 Chrome
 const ANDROID_UA: string = 'Mozilla/5.0 (Linux; Android 14; M2012K11AC Build/UKQ1.230917.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36';
 const PC_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+// 搜图神器网页端主页
+const SOUTU_HOME_URL: string = 'https://soutushenqi.com/image/feature';
 const context = getContext(this) as common.UIAbilityContext;
 /**
  * 复制本地文件到应用沙箱,并返回保存后的沙箱中的文件路径
@@ -75,19 +77,6 @@ function copyLocalPicFilesDir(rawfilePath: string, newFileName: string): string 
   return dest.path;
 }
 
-async function copyUrlPicToFilesDir(picUrl: string, newFileName: string): Promise<string> {
-  let uri = '';
-  //读取网络图片并保存到沙箱路径下
-  let httpRequest = http.createHttp();
-  let data: http.HttpResponse = await (httpRequest.request(picUrl) as Promise<http.HttpResponse>);
-  if (data?.responseCode == http.ResponseCode.OK) {
-    let dstPath = context.filesDir + "/" + newFileName;
-    let dest: fs.File = fs.openSync(dstPath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE)
-    let writeLen: number = fs.writeSync(dest.fd, data.result as ArrayBuffer);
-    uri = dest.path;
-  }
-  return uri;
-}
 
 
 
@@ -95,7 +84,6 @@ async function copyUrlPicToFilesDir(picUrl: string, newFileName: string): Promis
 @Component
 struct Index {
   private isRefreshing: boolean = false;
-  private contextmenu_result: WebContextMenuResult | undefined = undefined;
   @State controller: webview.WebviewController = new webview.WebviewController();
   @State webDownloadFile: IAbstractDownloadHandler = new WebDownloadFileHelper()
   downloadWebLoading: CustomDialogController = new CustomDialogController({
@@ -107,134 +95,21 @@ struct Index {
     isModal: false
   })
 
-  saveButtonOptions: SaveButtonOptions = {
-    icon: SaveIconStyle.FULL_FILLED,
-    text: SaveDescription.SAVE_IMAGE,
-    buttonType: ButtonType.Capsule
-  } // 设置安全控件按钮属性
-  private result: WebContextMenuResult | undefined = undefined;
-  @State linkUrl: string = '';
-  @State imgUrl: string = '';
-  @State offsetX: number = 0;
-  @State offsetY: number = 0;
-  @State showMenu: boolean = false;
-  @State pic_w:number|undefined = 0;
-  @State pic_h:number|undefined = 0;
-  @State pic_dl_show:Visibility = Visibility.Hidden;
   private shouldClearCache: boolean = false;
-  @Builder
-  //构建自定义菜单及触发功能接口
-  MenuBuilder() {
-    Column() {
-      Row()
-        .height(10)
-      Row(){
-        Text('是否保存至图库')
-          .fontColor($r('app.color.dialog_text'))
-          .fontSize(18)
-      }
-      Row(){
-        //Text(this.imgUrl)
-      }
-        .height(10)
-      Row(){
-        Image(this.imgUrl)
-          .onComplete((event) => {
-            this.pic_w = event?.width;
-            this.pic_h = event?.height;
-            this.pic_dl_show = Visibility.Visible;
-            })
-          .onError(()=>{
-            this.showMenu=false;
-            this.pic_dl_show = Visibility.Hidden;
-          })
-          .width('80%')
-          .backgroundColor($r('app.color.panel_bg'))
-          .borderRadius(15)
-          .objectFit(ImageFit.ScaleDown)
-          .constraintSize({maxHeight: '50%',maxWidth:'80%'})
-      }
-      //.constraintSize({maxHeight: '50%',maxWidth:'80%'})
-
-      Row() {
-        Button("取消").onClick((event: ClickEvent) => {
-          this.showMenu = false;
-          this.pic_dl_show = Visibility.Hidden;
-        })
-          .height(32)
-          .backgroundColor($r('app.color.ctx_menu_bg'))
-        Text()
-          .width(10)
-        SaveButton(this.saveButtonOptions) // 创建安全控件按钮。
-          .onClick(async (event, result: SaveButtonOnClickResult) => {
-            if (result == SaveButtonOnClickResult.SUCCESS) {
-              try {
-                let context = getContext();
-                let phAccessHelper = photoAccessHelper.getPhotoAccessHelper(context);
-                let uri = '';
-                //复制图片到应用沙箱目录下，并获取uri
-                if (this.imgUrl?.includes('rawfile')) {
-                  let rawFileName: string = this.imgUrl.substring(this.imgUrl.lastIndexOf('/') + 1);
-                  console.info(TAG, `rawfileName ${rawFileName}`)
-                  uri = copyLocalPicFilesDir(rawFileName, 'copyFile.png');
-                } else if (this.imgUrl?.includes('http') || this.imgUrl?.includes('https')) { // 针对http|https 协议的网络图片
-                  uri = await copyUrlPicToFilesDir(this.imgUrl, `onlinePic_${systemDateTime.getTime()}.png`)
-                }
-                let assetChangeRequest: photoAccessHelper.MediaAssetChangeRequest = photoAccessHelper.MediaAssetChangeRequest.createImageAssetRequest(context, uri);
-                await phAccessHelper.applyChanges(assetChangeRequest);
-                console.info('createAsset successfully, uri: ' + assetChangeRequest.getAsset().uri);
-                this.showMenu = false;
-              } catch (err) {
-                console.error(`create asset failed with error: ${err.code}, ${err.message}`);
-                //this.showMenu = false;
-              }
-            } else {
-              console.error('SaveButtonOnClickResult create asset failed');
-              //this.showMenu = false;
-            }
-            //this.showMenu = false;
-          })
-      }
-      .height(32)
-      .margin({ top: 20, bottom: 20 })
-      .justifyContent(FlexAlign.Center)
-    }
-    .width('80%')
-    .backgroundColor($r('app.color.ctx_menu_bg'))
-    .borderRadius(10)
-    .visibility(this.pic_dl_show)
-  }
-
-
-
-  async saveBase64Image(base64Str:string) {
-
-    try {
-      const context = getContext(this);
-      let helper = photoAccessHelper.getPhotoAccessHelper(context);
-      let uri = await helper.createAsset(photoAccessHelper.PhotoType.IMAGE, 'png')
-      let imageStr = base64Str.split(',')[1];
-      //打开文件
-      let file = fs.openSync(uri, fs.OpenMode.READ_WRITE);
-      //base64字符串转成buffer
-      const decodeBuffer = buffer.from(imageStr, 'base64').buffer;
-      //写入文件
-      fs.writeSync(file.fd, decodeBuffer);
-      //关闭文件
-      fs.closeSync(file);
-
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
+  // Cookie 登录（v1.7.4）：设置面板粘贴网页版 Cookie 写入 WebView CookieStore
+  @State savedCookie: string = '';
+  @State cookieInput: string = '';
+  private cookiePending: boolean = false;
+  // 启动性能：Web 首帧 src 用普通属性（非 @State），偏好设置晚于首帧就绪时不再触发二次加载
+  private firstSrc: string = SOUTU_HOME_URL;
+  private webReady: boolean = false;
   @State refreshing: boolean = false
   @State list: number[] = Array(20).fill(Date.now())
   @State is_home: boolean = false;
   @State showDialog: boolean = false;
   //home_url = "http://nas2.smder.com:3002"
   @State home_url: string = ''
-  @State saved_home_url: string = 'https://soutushenqi.com/image/feature';
+  @State saved_home_url: string = SOUTU_HOME_URL;
   @State c_pg_ua: string = '';
   @State c_ua_temp: string = '';
   @State ua_type: string = 'Mobile';
@@ -257,6 +132,12 @@ struct Index {
   @State safeTopVp: number = 0;
   // 全屏避让填充色：状态栏区域与页面顶部采样色一致，避免色差断层
   @State topFillColor: string = '';
+  // 状态栏原生高度(vp)：全屏布局下二三级页面的避让量来源
+  private statusVp: number = 0;
+  // 当前窗口是否为全屏布局（setWindowLayoutFullScreen(true) 后窗口延伸到状态栏下）
+  private fullLayout: boolean = false;
+  // 当前主文档 URL：用于区分首页一级界面（保持沉浸不避让）与二三级页面（避让状态栏）
+  private pageUrl: string = '';
   private lastTopBg: string = '';
   private lastBottomBg: string = '';
   // 长按上下文菜单（图片/视频）
@@ -268,30 +149,33 @@ struct Index {
 
 
 
-
   async setSystemFull(is_full: string, is_hidestatus: string, is_hidebar: string) {
     let windowClass = await window.getLastWindow(context_index)
     if (is_full == 'true') {
       if (is_hidestatus == 'true') {
         if (is_hidebar == 'true') {
-          await windowClass.setWindowLayoutFullScreen(true)
+          await windowClass.setWindowLayoutFullScreen(true);
+          this.fullLayout = true;
           await windowClass.setSpecificSystemBarEnabled('status', true, true);
           await windowClass.setSpecificSystemBarEnabled('navigationIndicator', true, true);
 
         } else {
-          await windowClass.setWindowLayoutFullScreen(true)
+          await windowClass.setWindowLayoutFullScreen(true);
+          this.fullLayout = true;
           await windowClass.setSpecificSystemBarEnabled('status', true, true);
           await windowClass.setSpecificSystemBarEnabled('navigationIndicator', false, true);
 
         }
       } else {
         if (is_hidebar == 'true') {
-          await windowClass.setWindowLayoutFullScreen(true)
+          await windowClass.setWindowLayoutFullScreen(true);
+          this.fullLayout = true;
           await windowClass.setSpecificSystemBarEnabled('status', false, true);
           await windowClass.setSpecificSystemBarEnabled('navigationIndicator', true, true);
 
         } else {
-          await windowClass.setWindowLayoutFullScreen(true)
+          await windowClass.setWindowLayoutFullScreen(true);
+          this.fullLayout = true;
           await windowClass.setSpecificSystemBarEnabled('status', false, true);
           await windowClass.setSpecificSystemBarEnabled('navigationIndicator', false, true);
 
@@ -302,24 +186,28 @@ struct Index {
         if (is_hidebar == 'true') {
           // 小白条开启：必须全屏布局。非全屏布局下系统会把导航栏画成默认黑，
           // navigationBarColor 被忽略；全屏布局下窗口延伸到小白条下方，采样色可正常上屏
-          await windowClass.setWindowLayoutFullScreen(true)
+          await windowClass.setWindowLayoutFullScreen(true);
+          this.fullLayout = true;
           await windowClass.setSpecificSystemBarEnabled('status', true, true);
           await windowClass.setSpecificSystemBarEnabled('navigationIndicator', true, true);
         } else {
-          await windowClass.setWindowLayoutFullScreen(false)
+          await windowClass.setWindowLayoutFullScreen(false);
+          this.fullLayout = false;
           await windowClass.setSpecificSystemBarEnabled('status', true, true);
           await windowClass.setSpecificSystemBarEnabled('navigationIndicator', false, true);
 
         }
       } else {
         if (is_hidebar == 'true') {
-          await windowClass.setWindowLayoutFullScreen(true)
+          await windowClass.setWindowLayoutFullScreen(true);
+          this.fullLayout = true;
           await windowClass.setSpecificSystemBarEnabled('status', false, true);
 
           await windowClass.setSpecificSystemBarEnabled('navigationIndicator', true, true);
 
         } else {
-          await windowClass.setWindowLayoutFullScreen(false)
+          await windowClass.setWindowLayoutFullScreen(false);
+          this.fullLayout = false;
           await windowClass.setSpecificSystemBarEnabled('status', false, true);
           await windowClass.setSpecificSystemBarEnabled('navigationIndicator', false, true);
 
@@ -332,12 +220,43 @@ struct Index {
     setTimeout(() => {
       this.updateSystemBarStyle(this.lastTopBg, this.lastBottomBg);
     }, 350);
-    // 计算状态栏高度留白（下拉顶栏避开状态栏）
+    // 状态栏原生高度：全屏布局下二三级页面避让用；非全屏布局窗口自动避让，不加 padding
     try {
       const area = windowClass.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
-      this.safeTopVp = px2vp(area.topRect.top);
+      this.statusVp = px2vp(area.topRect.top);
     } catch (err) {
-      this.safeTopVp = 0;
+      this.statusVp = 0;
+    }
+    this.pageUrl = this.saved_home_url || '';
+    this.updateSafeTop();
+  }
+
+  /** 一级界面判定：主文档 URL 与设置的主页一致（去 query/hash、归一尾斜杠）视为首页，保持沉浸不避让 */
+  private isTopLevelUrl(url: string): boolean {
+    try {
+      const norm = (u: string): string => {
+        let s = (u || '').split('#')[0].split('?')[0];
+        if (s.length > 1 && s.endsWith('/')) {
+          s = s.substring(0, s.length - 1);
+        }
+        return s;
+      };
+      const home = norm(this.saved_home_url);
+      if (home === '') {
+        return false;
+      }
+      return norm(url) === home;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /** 按布局模式与页面层级计算避让量：仅全屏布局且非首页一级界面时避让状态栏 */
+  private updateSafeTop(): void {
+    const target: number = (this.fullLayout && this.statusVp > 0 && !this.isTopLevelUrl(this.pageUrl))
+      ? this.statusVp : 0;
+    if (target !== this.safeTopVp) {
+      this.safeTopVp = target;
     }
   }
 
@@ -368,19 +287,35 @@ struct Index {
         this.downloadWebLoading.close()
       }
     })
-    this.isLSRefresh = await getLSRefresh() || this.isLSRefresh;
-    this.c_pg_ua = await getUserAgent() || this.c_pg_ua;
-    this.c_ua_temp = await getUserAgent() || this.c_pg_ua;
-    this.saved_home_url = await getHomeUrl() || this.saved_home_url;
-    this.isHidebar = (await getIshidebar() || this.isHidebar);
-    this.isHidestatus = (await getIshidestatus() || this.isHidestatus);
-    this.ua_type = (await getUserAgentType() || this.ua_type);
-    this.isFull = (await getIsfull() || this.isFull);
-    this.slide_num = (await getSlidenum() || this.slide_num);
-    this.webDark = (await getWebDarkMode() || this.webDark);
-    // 内核已在 EntryAbility.onCreate 预热并预连接主页，这里不再重复加载：
-    // Web 组件首帧由 src={this.saved_home_url} 发起，避免同 URL 二次导航
+    // 启动性能：偏好读取并行化（原先 12 次串行 await，每次都阻塞一帧）
+    const slidePromise = getSlidenum();
+    const prefs: string[] = await Promise.all([
+      getLSRefresh(), getUserAgent(), getHomeUrl(), getIshidebar(), getIshidestatus(),
+      getUserAgentType(), getIsfull(), getWebDarkMode(), getWebCookie()
+    ]);
+    const slideN: number = await slidePromise;
+    this.isLSRefresh = prefs[0] || this.isLSRefresh;
+    this.c_pg_ua = prefs[1] || this.c_pg_ua;
+    this.c_ua_temp = prefs[1] || this.c_pg_ua;
+    this.saved_home_url = prefs[2] || this.saved_home_url;
+    this.isHidebar = (prefs[3] || this.isHidebar);
+    this.isHidestatus = (prefs[4] || this.isHidestatus);
+    this.ua_type = (prefs[5] || this.ua_type);
+    this.isFull = (prefs[6] || this.isFull);
+    this.slide_num = slideN || this.slide_num;
+    this.webDark = (prefs[7] || this.webDark);
+    // Cookie 登录：内核已在 EntryAbility 预热，首帧加载前写入可随首个请求生效；
+    // 写入失败（内核未就绪）时置 pending，由 onControllerAttached 补写并刷新一次
+    this.savedCookie = (prefs[8] || '').trim();
+    if (this.savedCookie !== '' && !this.applyWebCookie()) {
+      this.cookiePending = true;
+    }
+    // 启动性能：首帧 src 尚未被消费时直接用真实首页，避免"先默认页再跳转"的二次加载
+    if (!this.webReady && this.saved_home_url) {
+      this.firstSrc = this.saved_home_url;
+    }
     setTimeout(() => {
+      this.backToHome();
       this.setSystemFull(this.isFull, this.isHidestatus, this.isHidebar);
     }, 50);
   }
@@ -463,7 +398,7 @@ struct Index {
           //.type(ButtonType.Normal)
           Button("清除缓存")
             .onClick(() => {
-              this.controller.removeCache(true)
+              this.controller.removeCache(true);
             })
             .height(32)
             .width("25%")
@@ -500,7 +435,7 @@ struct Index {
       Refresh({ refreshing: $$this.refreshing, builder: this.content() }) {
         NavDestination() {
           Column() {
-            Web({ src: this.saved_home_url, controller: this.controller })
+            Web({ src: this.firstSrc, controller: this.controller })
               .onControllerAttached(() => {
                 this.controller.setNetworkAvailable(true);
                 this.webDownloadFile.setDownloadDelegate(this.controller);
@@ -517,46 +452,20 @@ struct Index {
                 } catch (error) {
                   console.error(`ErrorCode: ${(error as BusinessError).code},  Message: ${(error as BusinessError).message}`);
                 }
-              })
-              .onContextMenuShow((event) => {
-                  this.result = event.result
-                  this.linkUrl = event.param.getLinkUrl();
-                  this.imgUrl = event.param.getSourceUrl();
-                  let hitValue = this.controller.getHitTestValue()
-                  let img64 = hitValue.extra
-                if(this.imgUrl==''&&img64!=''){
-                  this.imgUrl = img64
-                }
-                //this.linkUrl = this.imgUrl
-                let mediaType = event.param.getMediaType()
-                if (mediaType === ContextMenuMediaType.Image) {
-                  if(this.imgUrl.startsWith("data:image")) {
-                    //this.saveBase64Image(img64);
-                  }else{
-                    if(this.imgUrl != '') {
-                      this.showMenu = true;
-                      this.pic_dl_show = Visibility.Hidden;
-                    }
+                // Cookie 登录兜底：aboutToAppear 时内核未就绪导致写入失败的，这里补写；
+                // 补写成功后整页加载真实首页（缓存打底页若在则被替换），保证登录态随请求生效
+                if (this.cookiePending) {
+                  this.cookiePending = false;
+                  if (this.applyWebCookie()) {
+                    setTimeout(() => {
+                      try {
+                        this.controller.loadUrl(this.saved_home_url || SOUTU_HOME_URL);
+                      } catch (err) {
+                      }
+                    }, 300);
                   }
                 }
-
-                //this.offsetX = 0;
-                //this.offsetY = Math.max(px2vp(event?.param.y() ?? 0) - 0, 0);
-                return true;
               })
-              .bindPopup(this.showMenu,
-                {
-                  builder: this.MenuBuilder(),
-                  enableArrow: false,
-                  placement: Placement.LeftTop,
-                  offset: { x: this.offsetX, y: this.offsetY },
-                  mask: false,
-                  onStateChange: (e) => {
-                    if (!e.isVisible) {
-                      this.showMenu = false;
-                    }
-                  }
-                })
               //.cacheMode(CacheMode.Online)
               .domStorageAccess(true)
               //.multiWindowAccess(true)
@@ -598,16 +507,58 @@ struct Index {
                     this.openExternalApp(url);
                     return true; // 拦截，不让 WebView 自己加载
                   }
+                  // 主文档导航：按页面层级刷新状态栏避让（首页沉浸，二三级避让）
+                  if ((scheme === 'http' || scheme === 'https') && event.data.isMainFrame()) {
+                    this.pageUrl = url;
+                    this.updateSafeTop();
+                  }
                 }
                 return false;
+              })
+              .onShowFileSelector((event) => {
+                // 搜图神器网页适配：<input type=file>（以图搜图上传）拉起系统图库选图。
+                // ArkWeb 默认不处理网页文件选择，必须接管并回传文件句柄
+                try {
+                  const photoSelectOptions = new photoAccessHelper.PhotoSelectOptions();
+                  photoSelectOptions.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
+                  photoSelectOptions.maxSelectNumber = 1;
+                  const photoPicker = new photoAccessHelper.PhotoViewPicker();
+                  photoPicker.select(photoSelectOptions).then((photoSelectResult) => {
+                    if (photoSelectResult.photoUris && photoSelectResult.photoUris.length > 0) {
+                      const fileList: object[] = [];
+                      for (const photoUri of photoSelectResult.photoUris) {
+                        const file = fs.openSync(photoUri, fs.OpenMode.READ_ONLY);
+                        fileList.push({
+                          uri: photoUri,
+                          fileName: file.name,
+                          fd: file.fd
+                        });
+                      }
+                      event.result.handleFileList(fileList);
+                    } else {
+                      event.result.handleFileList([]);
+                    }
+                  }).catch(() => {
+                    try {
+                      event.result.handleFileList([]);
+                    } catch (err) {
+                    }
+                  });
+                } catch (err) {
+                  try {
+                    event.result.handleFileList([]);
+                  } catch (err2) {
+                  }
+                  return false;
+                }
+                return true;
               })
 
           }
           .width("100%")
           .height("100%")
-          // 状态栏避让：全屏布局下 Web 从状态栏下方起排，避让区用页面顶部采样色填充
+          // 顶部状态栏避让：全屏布局下二三级页面内容整体下移，避免顶到状态栏
           .padding({ top: this.safeTopVp })
-          .backgroundColor(this.topFillColor === '' ? $r('app.color.panel_bg') : this.topFillColor)
 
         }
 
@@ -688,6 +639,8 @@ struct Index {
                 }
               })
           }
+          // 搜图神器壳：首页地址行常显（原壳 1.7.9 默认隐藏，这里恢复）
+          .visibility(Visibility.Visible)
 
           Row()
             .height(10)
@@ -758,6 +711,7 @@ struct Index {
                 }
               })
           }
+          // 搜图神器壳：UA 选择行常显（默认手机=安卓客户端 UA）
           .justifyContent(FlexAlign.SpaceAround)
           .width('100%')
 
@@ -792,7 +746,7 @@ struct Index {
                 }
               })
           }
-          .visibility(this.ua_type == 'custom' ? Visibility.Visible : Visibility.None)
+          .visibility(Visibility.Visible)
 
           //.alignItems(VerticalAlign.Top)
           Row()
@@ -964,12 +918,11 @@ struct Index {
 
           }
 
-
           Row()
             .height(30)
 
           Row() {
-            Text("Version:1.0.0")
+            Text("Version:1.1.0")
               .fontColor($r('app.color.dialog_text_secondary'))
               .width('100%')
               .textAlign(TextAlign.Center)
@@ -978,6 +931,81 @@ struct Index {
 
           Row()
             .height(20)
+
+          // Cookie 登录逻辑保留（fetchCurrentCookie/applyWebCookie），UI 按需求隐藏；
+          // 已保存的 Cookie 仍在启动/页面加载时自动写入
+          Row() {
+            Text('登录 Cookie')
+              .fontColor($r('app.color.dialog_text'))
+              .width('30%')
+              .height(40)
+            TextInput({
+              placeholder: '粘贴网页版 Cookie',
+              text: this.cookieInput
+            })
+              .height(40)
+              .layoutWeight(1)
+              .fontSize(13)
+              .onChange((value: string) => {
+                this.cookieInput = value;
+              })
+
+            Button('应用')
+              .type(ButtonType.Capsule)
+              .backgroundColor($r('app.color.dialog_text_secondary'))
+              .margin({ left: 8 })
+              .height(40)
+              .width(72)
+              .onClick(() => {
+                const raw = (this.cookieInput || '').trim();
+                if (raw === '') {
+                  promptAction.showToast({ message: '请先粘贴 Cookie 串' });
+                  return;
+                }
+                this.savedCookie = raw;
+                saveWebCookie(raw);
+                const ok = this.applyWebCookie();
+                this.showSetting = false;
+                if (ok) {
+                  promptAction.showToast({ message: 'Cookie 已写入，刷新登录态' });
+                  this.refreshWeb();
+                } else {
+                  this.cookiePending = true;
+                  promptAction.showToast({ message: '内核未就绪，页面加载时自动重试' });
+                }
+              })
+          }
+          .width('100%')
+          .visibility(Visibility.None)
+
+          // 获取当前账号 Cookie（v1.7.5）：应用内已登录时一键取出 WebView 现有登录 Cookie，
+          // 填入上方输入框供查看/复制，再点"应用"固化到双域（与手动粘贴输入并存）
+          Row() {
+            Text('应用内已登录时，可一键取出当前登录 Cookie')
+              .fontSize(11)
+              .fontColor($r('app.color.dialog_text_secondary'))
+              .layoutWeight(1)
+            Button('获取当前 Cookie')
+              .type(ButtonType.Capsule)
+              .backgroundColor($r('app.color.dialog_text_secondary'))
+              .height(32)
+              .fontSize(12)
+              .onClick(() => {
+                const got = this.fetchCurrentCookie();
+                if (got === '') {
+                  promptAction.showToast({ message: '未取到 Cookie，请先在应用内登录' });
+                  return;
+                }
+                this.cookieInput = got;
+                promptAction.showToast({ message: '已填入当前 Cookie，点"应用"生效' });
+              })
+          }
+          .width('100%')
+          .margin({ top: 8 })
+          .visibility(Visibility.None)
+
+          Row()
+            .height(16)
 
           Row() {
             Button('返回')
@@ -1109,8 +1137,97 @@ struct Index {
 
   // 返回首页
   backToHome() {
-    // 这里可以改为你的首页路由
-    this.controller.loadUrl(this.saved_home_url);
+    // 启动性能：当前已在目标首页（首帧 src 命中）时跳过，避免同 URL 重复加载
+    try {
+      const target = this.saved_home_url || SOUTU_HOME_URL;
+      let current = '';
+      try {
+        current = this.controller.getUrl() || '';
+      } catch (e) {
+        current = '';
+      }
+      if (current !== '' && current === target) {
+        return;
+      }
+      this.controller.loadUrl(target);
+    } catch (err) {
+    }
+  }
+
+  /** 获取当前 Cookie：从 WebView CookieStore 读出搜图神器两个域的现有 Cookie，
+   * 按名称去重合并（账号域后写、覆盖主站同名项，保证登录态优先），
+   * 拼成 k=v; k=v 串返回。空串表示取不到（未登录/内核未就绪） */
+  private fetchCurrentCookie(): string {
+    const names: string[] = [];
+    const values: string[] = [];
+    const sources: string[] = ['https://soutushenqi.com', 'https://web-assets.soutushenqi.com'];
+    for (let s = 0; s < sources.length; s++) {
+      let raw = '';
+      try {
+        raw = webview.WebCookieManager.fetchCookieSync(sources[s]) || '';
+      } catch (err) {
+        raw = '';
+      }
+      const parts = raw.split(';');
+      for (let i = 0; i < parts.length; i++) {
+        const kv = parts[i].trim();
+        const eq = kv.indexOf('=');
+        if (eq <= 0) {
+          continue;
+        }
+        const name = kv.substring(0, eq).trim();
+        const value = kv.substring(eq + 1).trim();
+        if (name === '' || value === '') {
+          continue;
+        }
+        let idx = -1;
+        for (let j = 0; j < names.length; j++) {
+          if (names[j] === name) {
+            idx = j;
+            break;
+          }
+        }
+        if (idx >= 0) {
+          values[idx] = value;
+        } else {
+          names.push(name);
+          values.push(value);
+        }
+      }
+    }
+    let out = '';
+    for (let j = 0; j < names.length; j++) {
+      out = out + (out === '' ? '' : '; ') + names[j] + '=' + values[j];
+    }
+    return out;
+  }
+
+  /** Cookie 登录：把用户粘贴的 Cookie 串逐对写入
+   * soutushenqi.com 域，写入后随请求自动携带。
+   * 返回是否成功写入；串为空返回 false（不置 pending） */
+  private applyWebCookie(): boolean {
+    const raw = (this.savedCookie || '').trim();
+    if (raw === '') {
+      return false;
+    }
+    let ok = false;
+    try {
+      const parts = raw.split(';');
+      for (let i = 0; i < parts.length; i++) {
+        const kv = parts[i].trim();
+        if (kv.indexOf('=') <= 0) {
+          continue;
+        }
+        try {
+          webview.WebCookieManager.configCookieSync('https://soutushenqi.com', kv);
+          ok = true;
+        } catch (err) {
+        }
+      }
+    } catch (e) {
+      return false;
+    }
+    return ok;
   }
 
   // 用系统/外部应用打开非网页协议链接（如应用深链 scheme）
@@ -1120,19 +1237,22 @@ struct Index {
       // 优先走系统链接分发（Deep Linking / App Linking），可拉起注册了该协议的应用
       let linkOptions: OpenLinkOptions = { appLinkingOnly: false };
       await uiContext.openLink(url, linkOptions);
+      return;
     } catch (e) {
-      // 兜底：显式构造 Want 拉起
-      try {
-        let want: Want = {
-          action: 'ohos.want.action.viewData',
-          uri: url
-        };
-        await uiContext.startAbility(want);
-      } catch (err) {
-        promptAction.showToast({ message: '未找到可以打开此链接的应用' });
-      }
     }
+    try {
+      // 兜底：显式构造 Want 拉起
+      let want: Want = {
+        action: 'ohos.want.action.viewData',
+        uri: url
+      };
+      await uiContext.startAbility(want);
+      return;
+    } catch (err) {
+    }
+    promptAction.showToast({ message: '未找到可以打开此链接的应用' });
   }
+
 
   get_isWebDark(): boolean {
     return this.webDark === 'dark';
@@ -1394,6 +1514,7 @@ struct Index {
     }
     return ua;
   }
+
 
   change_userAgent() {
     // 默认（Mobile）：伪装安卓客户端 UA，网页按 Android 手机环境渲染
