@@ -558,6 +558,10 @@ struct Index {
               .onControllerAttached(() => {
                 this.controller.setNetworkAvailable(true);
                 this.webDownloadFile.setDownloadDelegate(this.controller);
+                // 图片类下载拦截改走图库保存（站点内建保存按钮触发下载时不再落文件管理）
+                this.webDownloadFile.onImageDownload = (u: string): void => {
+                  this.saveWebImage(u);
+                };
                 if (this.shouldClearCache) {
                   this.shouldClearCache = false;
                   try {
@@ -759,6 +763,10 @@ struct Index {
             .onControllerAttached(() => {
               this.detailController.setNetworkAvailable(true);
               this.detailDownloadFile.setDownloadDelegate(this.detailController);
+              // 同主 Web：详情页内的图片类下载也改走图库保存
+              this.detailDownloadFile.onImageDownload = (u: string): void => {
+                this.saveWebImage(u);
+              };
               try {
                 this.detailController.setCustomUserAgent(this.getuseragentbytype(this.ua_type));
               } catch (error) {

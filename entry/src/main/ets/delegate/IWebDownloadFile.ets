@@ -17,6 +17,11 @@ export abstract class IAbstractDownloadHandler {
   protected downloadProgress: number = 0
   protected controller: webview.WebviewController | null = null
   protected isCustomPath: boolean = false
+  /**
+   * 图片类下载拦截回调（宿主页注入）：命中时不再走"另存到文件管理"链路，
+   * 由宿主页改走图库保存（取图字节 → 创建对话框/安全控件直写相册）。
+   */
+  public onImageDownload: ((url: string) => void) | null = null
 
   /**
    * 设置下载委托
@@ -162,11 +167,41 @@ export abstract class IAbstractDownloadHandler {
     }
   }
 
+  /** 图片下载判定：MIME 以 image/ 开头，或 URL 去参数后以常见图片扩展名结尾 */
+  private static isImageDownload(item: webview.WebDownloadItem): boolean {
+    try {
+      const mime: string = (item.getMimeType() || '').toLowerCase();
+      if (mime.indexOf('image/') === 0) {
+        return true;
+      }
+    } catch (err) {
+    }
+    try {
+      const url: string = (item.getUrl() || '').split('?')[0].toLowerCase();
+      return /\.(jpe?g|png|gif|webp|bmp|heic)$/.test(url);
+    } catch (err) {
+      return false;
+    }
+  }
+
   /**
    * 初始化委托回调
    * */
   private setupDelegateCallbacks(delegate: webview.WebDownloadDelegate) {
     delegate.onBeforeDownload((item: webview.WebDownloadItem) => {
+      // 图片类下载（站点内建保存按钮/MIME 为 image 或 URL 带图片扩展名）拦截改走图库：
+      // 取消下载任务并交给宿主页的图库保存链路，绝不落文件管理
+      if (this.onImageDownload && IAbstractDownloadHandler.isImageDownload(item)) {
+        const url: string = item.getUrl() || '';
+        try {
+          item.cancel();
+        } catch (err) {
+        }
+        if (url.length > 0) {
+          this.onImageDownload(url);
+        }
+        return;
+      }
       this.webDownloadItem = item
       this.handleDownloadStart()
     })
