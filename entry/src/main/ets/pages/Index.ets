@@ -32,6 +32,7 @@ import { WebDownloadFileHelper } from '../delegate/WebDownloadFileImpl'
 import { EmitterUtil } from '../utiles/EmitterUtil'
 import { WEB_CHROME_SCRIPT } from '../utiles/WebChromeScript'
 import { WebImageSaver } from '../services/WebImageSaver'
+import { ImageResourceSniffer } from '../services/ImageResourceSniffer'
 import { http } from '@kit.NetworkKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
@@ -591,6 +592,20 @@ struct Index {
                   }
                 }
               })
+              // 资源嗅探（aira media discovery 同构）：页面加载图片时后台原生抓取字节入缓存，
+              // 长按保存直接命中缓存秒弹窗；返回 null 交内核正常加载，不影响显示
+              .onInterceptRequest((event) => {
+                if (event) {
+                  try {
+                    const u: string = event.request.getRequestUrl();
+                    if (ImageResourceSniffer.isLikelyImageUrl(u)) {
+                      ImageResourceSniffer.sniffAsync(u, this.userAgent);
+                    }
+                  } catch (err) {
+                  }
+                }
+                return null;
+              })
               //.cacheMode(CacheMode.Online)
               .domStorageAccess(true)
               //.multiWindowAccess(true)
@@ -780,6 +795,19 @@ struct Index {
                 this.detailController.setCustomUserAgent(this.getuseragentbytype(this.ua_type));
               } catch (error) {
               }
+            })
+            // 同主 Web：详情页资源嗅探
+            .onInterceptRequest((event) => {
+              if (event) {
+                try {
+                  const u: string = event.request.getRequestUrl();
+                  if (ImageResourceSniffer.isLikelyImageUrl(u)) {
+                    ImageResourceSniffer.sniffAsync(u, this.userAgent);
+                  }
+                } catch (err) {
+                }
+              }
+              return null;
             })
             .onConsole((event) => {
               // 沉浸式取色桥：与主 Web 同一探针，浮层期间系统栏跟随详情页配色
@@ -1976,6 +2004,13 @@ struct Index {
     }
     this.saveInFlightUrl = url;
     try {
+      // 资源嗅探缓存命中：页面加载该图时已后台抓取字节 → 直接秒出保存弹窗
+      const cached: ArrayBuffer | null = ImageResourceSniffer.getCached(url);
+      if (cached && cached.byteLength > 0 && WebImageSaver.isLikelyImage(cached)) {
+        hilog.info(0x0000, TAG, 'sniffer cache hit, instant save dialog');
+        await this.saveWebImageData(cached, url);
+        return;
+      }
       let data: ArrayBuffer | null = null;
       try {
         // 45s 总看门狗：取图链路任何一级卡死都不会无声无息（各阶段另有进度提示）
