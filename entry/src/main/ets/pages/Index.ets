@@ -1,6 +1,6 @@
 import { webview } from '@kit.ArkWeb';
 import { promptAction, window, display, mediaquery } from '@kit.ArkUI';
-import { common, Want, OpenLinkOptions } from '@kit.AbilityKit';
+import { common, Want, OpenLinkOptions, ConfigurationConstant } from '@kit.AbilityKit';
 import {
   saveHomeUrl,
   getHomeUrl,
@@ -309,7 +309,7 @@ struct Index {
     try {
       this.darkMQL = mediaquery.matchMediaSync('(dark-mode: dark)');
       this.darkMQL.on('change', (res: mediaquery.MediaQueryResult) => {
-        this.onSystemDarkChanged(res.matches as boolean);
+        this.onSystemDarkChanged(this.detectSystemDark(res.matches as boolean));
       });
     } catch (err) {
     }
@@ -369,7 +369,7 @@ struct Index {
     // 初始系统深浅色同步（在偏好读取后执行）：开关打开时按系统深浅色决定网页深色
     try {
       if (this.darkMQL) {
-        this.onSystemDarkChanged(this.darkMQL.matches as boolean);
+        this.onSystemDarkChanged(this.detectSystemDark(this.darkMQL.matches as boolean));
       }
     } catch (err) {
     }
@@ -391,6 +391,28 @@ struct Index {
       }
     } catch (err) {
     }
+  }
+
+  /**
+   * 系统深色判定（双源校验）：优先取 UIAbility 配置色模式（应用跟随系统时与系统一致），
+   * 拿不到时回退 mediaquery 结果。v1.1.5 真机出现 matches 与系统相反的现象，改以配置为准，
+   * 并打 hilog 记录两源取值，便于异常时定位。
+   */
+  private detectSystemDark(queryMatches: boolean): boolean {
+    let cfg: number = 0; // 0=未知 1=深色 2=浅色
+    try {
+      const cm = context_index.config?.colorMode;
+      if (cm === ConfigurationConstant.ColorMode.COLOR_MODE_DARK) {
+        cfg = 1;
+      } else if (cm === ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT) {
+        cfg = 2;
+      }
+    } catch (err) {
+    }
+    const dark: boolean = cfg === 1 ? true : (cfg === 2 ? false : queryMatches);
+    hilog.info(0x0000, TAG, 'sysDark detect: cfg=%{public}d, query=%{public}s, result=%{public}s',
+      cfg, queryMatches ? 'dark' : 'light', dark ? 'dark' : 'light');
+    return dark;
   }
 
   /** 系统深浅色变化：仅开关打开时响应——系统深色→网页深色；系统浅色→网页浅色。开关状态本身不变 */
@@ -1634,7 +1656,7 @@ struct Index {
       }
       this.ctxUrl = sourceUrl;
       if (mediaType === 1) {
-        this.ctxItems = ['保存图片', '复制图片链接'];
+        this.ctxItems = ['保存图片', '复制图片', '分享图片', '复制图片链接'];
       } else {
         this.ctxItems = ['复制视频链接', '其他应用打开'];
       }
@@ -1642,7 +1664,7 @@ struct Index {
       const screenWVp: number = px2vp(display.getDefaultDisplaySync().width);
       const screenHVp: number = px2vp(display.getDefaultDisplaySync().height);
       this.ctxX = Math.min(Math.max(px2vp(xPx), 8), Math.max(screenWVp - 178, 8));
-      this.ctxY = Math.min(Math.max(px2vp(yPx), 8), Math.max(screenHVp - 140, 8));
+      this.ctxY = Math.min(Math.max(px2vp(yPx), 8), Math.max(screenHVp - 200, 8));
       if (event.result) {
         try {
           event.result.closeContextMenu();
@@ -1752,8 +1774,13 @@ struct Index {
     });
   }
 
-  /** 长按保存图片：原生多 Referer 直取 → 失败回退页面内 fetch → 字节落图库（弹窗/选择器双通道） */
-  private async saveWebImage(url: string): Promise<void> {
+  /**
+   * 统一取图通道（保存/复制/分享共用）：
+   * 1) 原生直取（URL 候选 × Referer 策略组合重试，含魔数校验）
+   * 2) 页面内 fetch 兜底（同源图/带 CORS 头的跨域图，与 <img> 同凭证上下文）
+   * 两级都失败抛错，由调用方提示。
+   */
+  private async getWebImageBytes(url: string): Promise<ArrayBuffer> {
     const ctl: webview.WebviewController =
       this.detailVisible ? this.detailController : this.controller;
     let pageUrl: string = '';
@@ -1768,30 +1795,61 @@ struct Index {
     } catch (err) {
       cookie = '';
     }
-    // 1) 原生直取（Referer 依次：当前页 URL → 空 → 图片自身 origin）
     try {
       const data: ArrayBuffer =
         await WebImageSaver.fetchImageEx(url, pageUrl, cookie, this.userAgent);
       if (data && data.byteLength > 0) {
-        await WebImageSaver.saveImageBytes(context_index, data, url);
-        return;
+        return data;
       }
     } catch (err) {
       const be = err as BusinessError;
       hilog.warn(0x0000, TAG, 'native fetch all strategies failed: %{public}s',
         (be && be.message) ? be.message : '?');
     }
-    // 2) 页面内 fetch 兜底（同源图/带 CORS 头的跨域图；与 <img> 同凭证上下文）
+    const data2: ArrayBuffer | null = await this.fetchImageViaPage(url);
+    if (data2 && data2.byteLength > 0) {
+      return data2;
+    }
+    throw new Error('图片源拒绝访问（防盗链或网络受限）');
+  }
+
+  /** 长按保存图片：统一取图 → 字节落图库（弹窗/选择器双通道） */
+  private async saveWebImage(url: string): Promise<void> {
     try {
-      const data2: ArrayBuffer | null = await this.fetchImageViaPage(url);
-      if (data2 && data2.byteLength > 0) {
-        await WebImageSaver.saveImageBytes(context_index, data2, url);
-        return;
-      }
-      promptAction.showToast({ message: '保存失败：图片源拒绝访问（防盗链或网络受限）' });
+      const data: ArrayBuffer = await this.getWebImageBytes(url);
+      await WebImageSaver.saveImageBytes(context_index, data, url);
     } catch (err) {
       const be = err as BusinessError;
-      promptAction.showToast({ message: '保存失败：' + ((be && be.message) ? be.message : '未知错误') });
+      const msg: string = (be && be.message) ? be.message : '未知错误';
+      hilog.error(0x0000, TAG, 'save failed: %{public}s', msg);
+      promptAction.showToast({ message: '保存失败：' + msg });
+    }
+  }
+
+  /** 长按复制图片：统一取图 → 解码 PixelMap → 系统剪贴板 */
+  private async copyWebImage(url: string): Promise<void> {
+    try {
+      const data: ArrayBuffer = await this.getWebImageBytes(url);
+      await WebImageSaver.copyImageToClipboard(data);
+      promptAction.showToast({ message: '图片已复制，可粘贴发送' });
+    } catch (err) {
+      const be = err as BusinessError;
+      const msg: string = (be && be.message) ? be.message : '未知错误';
+      hilog.error(0x0000, TAG, 'copy image failed: %{public}s', msg);
+      promptAction.showToast({ message: '复制失败：' + msg });
+    }
+  }
+
+  /** 长按分享图片：统一取图 → 写缓存文件 → 系统分享面板 */
+  private async shareWebImage(url: string): Promise<void> {
+    try {
+      const data: ArrayBuffer = await this.getWebImageBytes(url);
+      await WebImageSaver.shareImageFile(context_index, data, url);
+    } catch (err) {
+      const be = err as BusinessError;
+      const msg: string = (be && be.message) ? be.message : '未知错误';
+      hilog.error(0x0000, TAG, 'share image failed: %{public}s', msg);
+      promptAction.showToast({ message: '分享失败：' + msg });
     }
   }
 
@@ -1800,6 +1858,10 @@ struct Index {
     const url = this.ctxUrl;
     if (item === '保存图片') {
       this.saveWebImage(url);
+    } else if (item === '复制图片') {
+      this.copyWebImage(url);
+    } else if (item === '分享图片') {
+      this.shareWebImage(url);
     } else if (item === '复制图片链接' || item === '复制视频链接') {
       WebImageSaver.copyText(url, '已复制链接');
     } else if (item === '其他应用打开') {

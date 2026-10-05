@@ -18,6 +18,9 @@ import { common } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { util } from '@kit.ArkTS';
+import { image } from '@kit.ImageKit';
+import { systemShare } from '@kit.ShareKit';
+import { uniformTypeDescriptor } from '@kit.ArkData';
 
 const MAX_BYTES: number = 30 * 1024 * 1024;
 const TAG: string = 'web-savePic';
@@ -215,6 +218,55 @@ export class WebImageSaver {
     }
   }
 
+  /** 复制图片本体到剪贴板（解码为 PixelMap 写入，粘到聊天输入框/备忘录即为图片） */
+  static async copyImageToClipboard(data: ArrayBuffer): Promise<void> {
+    if (!data || data.byteLength === 0) {
+      throw new Error('图片内容为空');
+    }
+    const source: image.ImageSource = image.createImageSource(data);
+    let pixelMap: image.PixelMap | null = null;
+    try {
+      pixelMap = await source.createPixelMap();
+      const clipData = pasteboard.createData(pasteboard.MIMETYPE_PIXELMAP, pixelMap);
+      await pasteboard.getSystemPasteboard().setData(clipData);
+      hilog.info(0x0000, TAG, 'image copied to pasteboard: %{public}d B', data.byteLength);
+    } finally {
+      if (pixelMap) {
+        await pixelMap.release().catch((_e: Error) => { });
+      }
+      await source.release().catch((_e: Error) => { });
+    }
+  }
+
+  /** 分享图片：字节写缓存文件 → 系统分享面板（移植自 aira-browser shareImage 方案） */
+  static async shareImageFile(context: common.UIAbilityContext, data: ArrayBuffer,
+    url: string): Promise<void> {
+    if (!data || data.byteLength === 0) {
+      throw new Error('图片内容为空');
+    }
+    const ext: string = WebImageSaver.sniffExtension(data, url);
+    const path: string = await WebImageSaver.writeToCache(context, data, ext);
+    const uri: string = fileUri.getUriFromPath(path);
+    const title: string = 'Soutu_' + Date.now() + '.' + ext;
+    const utd: uniformTypeDescriptor.UniformDataType =
+      ext === 'png' ? uniformTypeDescriptor.UniformDataType.PNG :
+        ext === 'gif' ? uniformTypeDescriptor.UniformDataType.GIF :
+          (ext === 'jpg' || ext === 'jpeg') ? uniformTypeDescriptor.UniformDataType.JPEG :
+            uniformTypeDescriptor.UniformDataType.IMAGE;
+    const shareData = new systemShare.SharedData({
+      utd: utd,
+      uri: uri,
+      title: title,
+      label: title
+    });
+    const controller = new systemShare.ShareController(shareData);
+    await controller.show(context, {
+      selectionMode: systemShare.SelectionMode.SINGLE,
+      previewMode: systemShare.SharePreviewMode.DEFAULT
+    });
+    hilog.info(0x0000, TAG, 'share panel opened: %{public}s (%{public}d B)', path, data.byteLength);
+  }
+
   static async fetchImage(url: string, referer: string,
     cookie: string, userAgent: string): Promise<ArrayBuffer> {
     const httpRequest = http.createHttp();
@@ -248,7 +300,7 @@ export class WebImageSaver {
     }
   }
 
-  private static sniffExtension(data: ArrayBuffer, url: string): string {
+  static sniffExtension(data: ArrayBuffer, url: string): string {
     try {
       const bytes = new Uint8Array(data.slice(0, 16));
       if (bytes.length >= 4) {
