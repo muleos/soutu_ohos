@@ -116,6 +116,18 @@ export async function saveWebCookie(v: string) {
   await store.flush();
 }
 
+// 底栏抬高（0-30vp）：设置面板可调，抬高量与底部填充色一起用（参照 TapTapWeb 壳）
+export async function saveBottomLift(v: string) {
+  const store = await getPreferences();
+  await store.put('bottom_lift', v);
+  await store.flush();
+}
+
+export async function getBottomLift(): Promise<string> {
+  const store = await getPreferences();
+  return String(await store.get('bottom_lift', ''));
+}
+
 export async function getWebCookie(): Promise<string> {
   const store = await getPreferences();
   return String(await store.get('web_cookie', ''));

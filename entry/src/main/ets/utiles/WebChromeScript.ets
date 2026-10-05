@@ -161,5 +161,148 @@ export const WEB_CHROME_SCRIPT: string = `
   /* 暴露给原生：详情浮层关闭后主动重报底层页面主题色 */
   window.__stqScheduleTheme = scheduleTheme;
 })();
+;(function () {
+  /* ---------------- 详情浮层桥（SPA 路由拦截） ----------------
+   * 站点（soutushenqi.com）是 Vue Router SPA，图片卡片点击走
+   *   isMobile()（window.screen.width<=768，手机上恒 true）? router.push(详情URL) : window.open(详情URL)
+   * 手机上走 pushState 客户端路由——不产生主文档加载，壳的 onLoadIntercept 详情浮层
+   * 根本不会触发，详情只能在主 WebView 内渲染；返回首页时列表页组件被重建
+   * （重新请求 + 滚动丢失），表现就是"首页重新加载"。
+   * 修复：在 history.pushState 处把"进入详情页"的导航截下来，改由壳的浮层承载——
+   *   ① 主 WebView 停在列表页不动（组件不卸载、滚动不丢、零重新请求）；
+   *   ② 详情 URL 经 console 上报原生（__STQ_DETAIL__），由浮层 Web 加载；
+   *   ③ 详情页依赖 opener 写在 sessionStorage[key] 里的列表数据，而 sessionStorage
+   *      不跨 Web 实例，故先镜像到 localStorage（同源共享），浮层 document-start 再还原。
+   * 参考实现：TapTapWeb 壳把 window.open 改写为壳内导航的同源兜底思路。
+   */
+  if ((location.hostname || '').indexOf('soutushenqi') < 0) { return; }
+  if (window.__stqDetailBridgeInstalled) { return; }
+  window.__stqDetailBridgeInstalled = 1;
+
+  var STQ_MIRROR_PREFIX = '__stq_sess_';
+  var STQ_SENTINEL = 'stq-detail-intercepted';
+
+  function stqAbs(u) {
+    try {
+      var s = String(u || '');
+      if (!s) { return ''; }
+      return new URL(s, location.href).href;
+    } catch (e) { return ''; }
+  }
+
+  function stqIsDetail(u) {
+    try {
+      return (new URL(u, location.href).pathname || '').indexOf('/detail') >= 0;
+    } catch (e) { return false; }
+  }
+
+  /* 当前文档自己就在详情页（浮层内的翻图）时不拦截，让站点在浮层内自由路由 */
+  function stqCurIsDetail() {
+    return (location.pathname || '').indexOf('/detail') >= 0;
+  }
+
+  function stqKeyOf(u) {
+    try { return new URL(u, location.href).searchParams.get('key') || ''; } catch (e) { return ''; }
+  }
+
+  /* 把 opener 写在 sessionStorage[key] 的列表数据镜像到 localStorage，供浮层还原 */
+  function stqMirrorSession(u) {
+    try {
+      var k = stqKeyOf(u);
+      if (!k) { return; }
+      var v = sessionStorage.getItem(k);
+      if (v) { localStorage.setItem(STQ_MIRROR_PREFIX + k, v); }
+    } catch (e) { }
+  }
+
+  function stqReport(u) {
+    try { console.info('__STQ_DETAIL__' + u); } catch (e) { }
+  }
+
+  /* 浮层侧还原：sessionStorage 缺失时从 localStorage 镜像补回；
+   * 都没有则写入空列表占位——详情页对该键做 JSON.parse，缺键会抛错整页白屏 */
+  function stqRestoreSession() {
+    try {
+      if (!stqCurIsDetail()) { return; }
+      var k = stqKeyOf(location.href);
+      if (!k || sessionStorage.getItem(k)) { return; }
+      var v = localStorage.getItem(STQ_MIRROR_PREFIX + k);
+      if (v) {
+        sessionStorage.setItem(k, v);
+        localStorage.removeItem(STQ_MIRROR_PREFIX + k);
+      } else {
+        sessionStorage.setItem(k, '{"list":[]}');
+      }
+    } catch (e) { }
+  }
+
+  /* 命中详情导航：上报原生并返回 true（调用方据此中断本次路由提交） */
+  function stqHit(u) {
+    var a = stqAbs(u);
+    if (!a || !stqIsDetail(a) || stqCurIsDetail()) { return false; }
+    stqMirrorSession(a);
+    stqReport(a);
+    return true;
+  }
+
+  stqRestoreSession();
+
+  var stqOrigPush = history.pushState;
+  var stqOrigReplace = history.replaceState;
+  /* 抛哨兵异常中断 Vue Router 提交：其 currentRoute 赋值在 history push 之后，
+   * 抛错即中止，内部路由状态与 DOM 都留在列表页（站点未监听 unhandledrejection） */
+  try {
+    history.pushState = function (state, title, url) {
+      if (arguments.length >= 3 && stqHit(url)) { throw new Error(STQ_SENTINEL); }
+      return stqOrigPush.apply(history, arguments);
+    };
+  } catch (e) { }
+  try {
+    history.replaceState = function (state, title, url) {
+      if (arguments.length >= 3 && stqHit(url)) { throw new Error(STQ_SENTINEL); }
+      return stqOrigReplace.apply(history, arguments);
+    };
+  } catch (e) { }
+  /* 哨兵异常已被本桥消化：吞掉对应的 unhandledrejection，避免控制台/站点误报 */
+  try {
+    window.addEventListener('unhandledrejection', function (e) {
+      var r = e && e.reason;
+      var msg = ((r && (r.message || r)) || '') + '';
+      if (msg.indexOf(STQ_SENTINEL) >= 0) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+    }, true);
+  } catch (e) { }
+
+  /* 兜底 A：window.open（电脑 UA / 大屏时站点走这条）→ 详情交给浮层，不再新开窗口 */
+  try {
+    var stqOrigOpen = window.open;
+    window.open = function (u) {
+      if (stqHit(u)) { return null; }
+      return stqOrigOpen.apply(window, arguments);
+    };
+  } catch (e) { }
+
+  /* 兜底 B：锚点直跳详情（站点改版成 <a href> 时） */
+  document.addEventListener('click', function (e) {
+    try {
+      var el = e.target;
+      while (el && el !== document.documentElement) {
+        if (el.tagName === 'A' && el.getAttribute('href')) {
+          var a = stqAbs(el.getAttribute('href'));
+          if (a && stqIsDetail(a) && !stqCurIsDetail()) {
+            stqMirrorSession(a);
+            stqReport(a);
+            e.preventDefault();
+            e.stopPropagation();
+          }
+          return;
+        }
+        el = el.parentElement;
+      }
+    } catch (err) { }
+  }, true);
+})();
 //# sourceURL=stq-web-chrome.js
 `;

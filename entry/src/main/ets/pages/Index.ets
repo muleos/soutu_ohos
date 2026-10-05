@@ -21,7 +21,9 @@ import {
   saveWebDarkMode,
   getWebDarkMode,
   saveWebCookie,
-  getWebCookie
+  getWebCookie,
+  saveBottomLift,
+  getBottomLift
 } from '../model/StorageService';
 import { DownloadConfirmDialog } from '../component/DownloadConfirmDialog'
 import { IAbstractDownloadHandler } from '../delegate/IWebDownloadFile'
@@ -136,6 +138,12 @@ struct Index {
   @State webDark: string = 'auto'; // 'auto'=跟随系统深浅色, 'dark'=强制深色
   // 沉浸式：状态栏高度留白(px->vp)，供下拉顶栏避开状态栏
   @State safeTopVp: number = 0;
+  // 底栏抬高设置值(0-30vp)：设置面板可调，抬高网页视口底部，避免网页底栏被小白条手势区压住
+  @State bottomLiftSetting: number = 28;
+  // 底栏抬高区填充色：与底部采样色一致（同状态栏避让的取色逻辑）
+  @State bottomFillColor: string = '';
+  // 主内容区实际高度(vp)：避让/抬高区分段取色的锚点
+  @State contentHeightVp: number = 0;
   // 全屏避让填充色：状态栏区域与页面顶部采样色一致，避免色差断层
   @State topFillColor: string = '';
   // 状态栏原生高度(vp)：全屏布局下二三级页面的避让量来源
@@ -257,13 +265,29 @@ struct Index {
     }
   }
 
-  /** 按布局模式与页面层级计算避让量：仅全屏布局且非首页一级界面时避让状态栏 */
+  /** 顶部避让量：全屏布局下窗口延伸到状态栏之下，必须整体下移，
+   *  否则网页顶部（站点自绘标题栏）会被系统状态栏压住 */
   private updateSafeTop(): void {
-    const target: number = (this.fullLayout && this.statusVp > 0 && !this.isTopLevelUrl(this.pageUrl))
-      ? this.statusVp : 0;
+    const target: number = (this.fullLayout && this.statusVp > 0) ? this.statusVp : 0;
     if (target !== this.safeTopVp) {
       this.safeTopVp = target;
     }
+  }
+
+  /** 渐变分段锚点：顶部避让区结束比例（0-1） */
+  private topStop(): number {
+    if (this.contentHeightVp <= 0 || this.safeTopVp <= 0) {
+      return 0;
+    }
+    return Math.min(1, this.safeTopVp / this.contentHeightVp);
+  }
+
+  /** 渐变分段锚点：底部抬高区开始比例（0-1） */
+  private bottomStop(): number {
+    if (this.contentHeightVp <= 0 || this.bottomLiftSetting <= 0) {
+      return 1;
+    }
+    return Math.max(0, 1 - this.bottomLiftSetting / this.contentHeightVp);
   }
 
   async aboutToAppear() {
@@ -297,7 +321,7 @@ struct Index {
     const slidePromise = getSlidenum();
     const prefs: string[] = await Promise.all([
       getLSRefresh(), getUserAgent(), getHomeUrl(), getIshidebar(), getIshidestatus(),
-      getUserAgentType(), getIsfull(), getWebDarkMode(), getWebCookie()
+      getUserAgentType(), getIsfull(), getWebDarkMode(), getWebCookie(), getBottomLift()
     ]);
     const slideN: number = await slidePromise;
     this.isLSRefresh = prefs[0] || this.isLSRefresh;
@@ -313,6 +337,11 @@ struct Index {
     // Cookie 登录：内核已在 EntryAbility 预热，首帧加载前写入可随首个请求生效；
     // 写入失败（内核未就绪）时置 pending，由 onControllerAttached 补写并刷新一次
     this.savedCookie = (prefs[8] || '').trim();
+    // 底栏抬高设置值(0-30vp)：默认 28（与 TapTapWeb 壳一致），超界纠正
+    const savedLift: number = Number(prefs[9] || '');
+    this.bottomLiftSetting = isNaN(savedLift)
+      ? 28
+      : Math.max(0, Math.min(30, Math.round(savedLift)));
     if (this.savedCookie !== '' && !this.applyWebCookie()) {
       this.cookiePending = true;
     }
@@ -496,6 +525,13 @@ struct Index {
                       this.applyImmersiveTheme(payload.bg || '', payload.bbg || '');
                     } catch (err) {
                     }
+                  } else if (msg.indexOf('__STQ_DETAIL__') === 0) {
+                    // SPA 路由桥：站点客户端路由进详情页已被注入脚本截获（主文档不导航），
+                    // 这里改由详情浮层承载——底层列表页保持挂载，返回时不重载、不丢滚动位置
+                    const durl: string = msg.substring('__STQ_DETAIL__'.length);
+                    if (durl !== '' && !this.detailVisible) {
+                      this.openDetailOverlay(durl);
+                    }
                   }
                 }
                 return false;
@@ -536,14 +572,11 @@ struct Index {
                   const photoPicker = new photoAccessHelper.PhotoViewPicker();
                   photoPicker.select(photoSelectOptions).then((photoSelectResult) => {
                     if (photoSelectResult.photoUris && photoSelectResult.photoUris.length > 0) {
-                      const fileList: object[] = [];
+                      // 本地 SDK 兼容：FileSelectorResult.handleFileList 只接受 Array<string>（文件 URI 列表），
+                      // 原写法传 {uri,fileName,fd} 对象数组会被 ArkTS 静态检查拒绝（untyped-obj-literals）
+                      const fileList: string[] = [];
                       for (const photoUri of photoSelectResult.photoUris) {
-                        const file = fs.openSync(photoUri, fs.OpenMode.READ_ONLY);
-                        fileList.push({
-                          uri: photoUri,
-                          fileName: file.name,
-                          fd: file.fd
-                        });
+                        fileList.push(photoUri);
                       }
                       event.result.handleFileList(fileList);
                     } else {
@@ -568,8 +601,26 @@ struct Index {
           }
           .width("100%")
           .height("100%")
-          // 顶部状态栏避让：全屏布局下二三级页面内容整体下移，避免顶到状态栏
-          .padding({ top: this.safeTopVp })
+          // 顶部：全屏布局下整体下移，网页顶部（站点标题栏）不被系统状态栏遮挡；
+          // 底部：抬高 0-30vp（设置面板可调），网页底栏不被小白条手势区压住
+          .padding({ top: this.safeTopVp, bottom: this.bottomLiftSetting })
+          // 避让/抬高区分段取色：上段用页面顶部采样色、下段用页面底部采样色（与系统栏同逻辑），
+          // 无采样时回退 panel_bg（浅色资源自适配深浅色）
+          .linearGradient({
+            angle: 180,
+            colors: [
+              [this.topFillColor === '' ? $r('app.color.panel_bg') : this.topFillColor, 0],
+              [this.topFillColor === '' ? $r('app.color.panel_bg') : this.topFillColor, this.topStop()],
+              [this.bottomFillColor === '' ? $r('app.color.panel_bg') : this.bottomFillColor, this.bottomStop()],
+              [this.bottomFillColor === '' ? $r('app.color.panel_bg') : this.bottomFillColor, 1]
+            ]
+          })
+          .onAreaChange((_oldArea: Area, newArea: Area) => {
+            const h: number = Number(newArea.height) || 0;
+            if (h > 0 && Math.abs(h - this.contentHeightVp) > 0.5) {
+              this.contentHeightVp = h;
+            }
+          })
 
         }
 
@@ -739,74 +790,95 @@ struct Index {
           Row()
             .height(10)
 
+          // 搜图神器壳：UA 选择行常显（默认手机=安卓客户端 UA）
+          // 三个选项等分剩余宽度并单行省略——原写法各 Text 不限宽，中文标签会把设置面板边框撑破
           Row() {
             Text("UA")
               .fontColor($r('app.color.dialog_text'))
+              .fontSize(14)
               .width('12%')
-            Text()
-              .width(15)
-            Radio({ value: 'Mobile', group: 'ua_type_group' })
-              .checked(this.ua_type === 'Mobile') // 判断是否选中
-              .onChange((isChecked) => {
-                if (isChecked) {
-                  this.ua_type = 'Mobile'; // 更新选中值
-                  saveUserAgentType('Mobile');
-                  this.change_userAgent();
-                  this.refreshWeb();
-                }
-              })
-              .height(20)
-            Text("手机(安卓客户端)")
-              .fontColor($r('app.color.dialog_text'))
-              .onClick(() => {
-                if (this.ua_type == 'custom') {
-                  this.c_ua_temp = this.getuseragentbytype('Mobile');
-                }
-              })
-            Text()
-              .width(7)
-            Radio({ value: 'PC', group: 'ua_type_group' })
-              .checked(this.ua_type === 'PC') // 判断是否选中
-              .onChange((isChecked) => {
-                if (isChecked) {
-                  this.ua_type = 'PC'; // 更新选中值
-                  saveUserAgentType('PC');
-                  this.change_userAgent();
-                  this.refreshWeb();
-                }
-              })
-              .height(20)
-            Text("电脑")
-              .fontColor($r('app.color.dialog_text'))
-              .onClick(() => {
-                if (this.ua_type == 'custom') {
-                  this.c_ua_temp = this.getuseragentbytype('PC');
-                }
-              })
-            Text()
-              .width(7)
 
-            Radio({ value: 'custom', group: 'ua_type_group' })
-              .checked(this.ua_type === 'custom') // 判断是否选中
-              .onChange((isChecked) => {
-                if (isChecked) {
-                  this.ua_type = 'custom'; // 更新选中值
-                  saveUserAgentType('custom');
-                  this.change_userAgent();
-                  this.refreshWeb();
-                }
-              })
-              .height(20)
-            Text("自定义")
-              .fontColor($r('app.color.dialog_text'))
-              .onClick(() => {
-                if (this.ua_type == 'custom') {
-                  this.c_ua_temp = this.getuseragentbytype('custom');
-                }
-              })
+            Row() {
+              Radio({ value: 'Mobile', group: 'ua_type_group' })
+                .checked(this.ua_type === 'Mobile')
+                .onChange((isChecked) => {
+                  if (isChecked) {
+                    this.ua_type = 'Mobile';
+                    saveUserAgentType('Mobile');
+                    this.change_userAgent();
+                    this.refreshWeb();
+                  }
+                })
+                .height(20)
+                .width(20)
+              Text("手机(安卓)")
+                .fontColor($r('app.color.dialog_text'))
+                .fontSize(12)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+                .onClick(() => {
+                  if (this.ua_type == 'custom') {
+                    this.c_ua_temp = this.getuseragentbytype('Mobile');
+                  }
+                })
+            }
+            .layoutWeight(1)
+
+            Row() {
+              Radio({ value: 'PC', group: 'ua_type_group' })
+                .checked(this.ua_type === 'PC')
+                .onChange((isChecked) => {
+                  if (isChecked) {
+                    this.ua_type = 'PC';
+                    saveUserAgentType('PC');
+                    this.change_userAgent();
+                    this.refreshWeb();
+                  }
+                })
+                .height(20)
+                .width(20)
+              Text("电脑")
+                .fontColor($r('app.color.dialog_text'))
+                .fontSize(12)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+                .onClick(() => {
+                  if (this.ua_type == 'custom') {
+                    this.c_ua_temp = this.getuseragentbytype('PC');
+                  }
+                })
+            }
+            .layoutWeight(1)
+
+            Row() {
+              Radio({ value: 'custom', group: 'ua_type_group' })
+                .checked(this.ua_type === 'custom')
+                .onChange((isChecked) => {
+                  if (isChecked) {
+                    this.ua_type = 'custom';
+                    saveUserAgentType('custom');
+                    this.change_userAgent();
+                    this.refreshWeb();
+                  }
+                })
+                .height(20)
+                .width(20)
+              Text("自定义")
+                .fontColor($r('app.color.dialog_text'))
+                .fontSize(12)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+                .onClick(() => {
+                  if (this.ua_type == 'custom') {
+                    this.c_ua_temp = this.getuseragentbytype('custom');
+                  }
+                })
+            }
+            .layoutWeight(1)
           }
-          // 搜图神器壳：UA 选择行常显（默认手机=安卓客户端 UA）
-          .justifyContent(FlexAlign.SpaceAround)
           .width('100%')
 
           Row() {
@@ -1006,6 +1078,38 @@ struct Index {
                 saveSlidenum(value / 100);
               })
             Text((this.slide_num * 100).toFixed(0))
+              .width('10%')
+              .height(32)
+              .textAlign(TextAlign.End)
+
+          }
+
+          Row() {
+            Text("底栏抬高")
+              .fontColor($r('app.color.dialog_text'))
+              .width("30%")
+              .height(32)
+            Text()
+              .width('10%')
+            Slider({
+              value: this.bottomLiftSetting,
+              step: 1,
+              min: 0,
+              max: 30,
+              style: SliderStyle.InSet
+            })
+              .width('50%')
+              .height(25)
+              .showSteps(true)
+              .onChange((value: number, mode: SliderChangeMode) => {
+                const v: number = Math.max(0, Math.min(30, Math.round(value)));
+                if (v === this.bottomLiftSetting && mode !== SliderChangeMode.End) {
+                  return;
+                }
+                this.bottomLiftSetting = v;
+                saveBottomLift(String(v));
+              })
+            Text(this.bottomLiftSetting.toFixed(0))
               .width('10%')
               .height(32)
               .textAlign(TextAlign.End)
@@ -1258,8 +1362,29 @@ struct Index {
 
   /** 打开详情浮层：详情在独立 Web 实例中加载，底层页面保持挂载 */
   openDetailOverlay(url: string) {
+    // 记录打开前底层页面 URL，用于下面的自愈判定
+    let before: string = '';
+    try {
+      before = this.controller.getUrl() || '';
+    } catch (err) {
+      before = '';
+    }
     this.detailUrl = url;
     this.detailVisible = true;
+    // 自愈：注入脚本靠抛哨兵异常中断站点客户端路由提交；若站点改版使中断失效，
+    // 底层 WebView 会自己落到详情页（与浮层重复显示）——在浮层遮挡期间回退一步，
+    // 关掉浮层时看到的仍是原列表页
+    if (before.indexOf('/detail') < 0) {
+      setTimeout(() => {
+        try {
+          const cur: string = this.controller.getUrl() || '';
+          if (cur.indexOf('/detail') >= 0 && this.controller.accessStep(-1)) {
+            this.controller.backward();
+          }
+        } catch (err) {
+        }
+      }, 900);
+    }
   }
 
   /** 关闭详情浮层：销毁浮层 Web，底层首页/搜索页保持挂载原状（不重载、滚动位置不变） */
@@ -1278,6 +1403,11 @@ struct Index {
 
   // 返回首页
   backToHome() {
+    // 详情浮层打开时：关掉浮层即可露出未重载的底层页面，不做整页加载
+    if (this.detailVisible) {
+      this.closeDetailOverlay();
+      return;
+    }
     // 启动性能：当前已在目标首页（首帧 src 命中）时跳过，避免同 URL 重复加载
     try {
       const target = this.saved_home_url || SOUTU_HOME_URL;
@@ -1288,6 +1418,11 @@ struct Index {
         current = '';
       }
       if (current !== '' && current === target) {
+        return;
+      }
+      // 站点客户端路由已经进到详情页（浮层未开）时，优先历史回退——loadUrl 会整页重载
+      if (current.indexOf('/detail') >= 0 && this.controller.accessStep(-1)) {
+        this.controller.backward();
         return;
       }
       this.controller.loadUrl(target);
@@ -1586,6 +1721,16 @@ struct Index {
       }
       if (fillTop !== this.topFillColor) {
         this.topFillColor = fillTop;
+      }
+      // 底栏抬高区填充色：与导航栏/底部采样色同一逻辑（无采样时深色用底栏色，浅色交给 panel_bg）
+      let fillBottom = '';
+      if (/^#[0-9a-fA-F]{6}$/.test(bottomBg)) {
+        fillBottom = dark && this.lumLight(bottomBg) ? this.darkenSample(bottomBg) : bottomBg;
+      } else {
+        fillBottom = dark ? '#161920' : '';
+      }
+      if (fillBottom !== this.bottomFillColor) {
+        this.bottomFillColor = fillBottom;
       }
     } catch (err) {
     }
