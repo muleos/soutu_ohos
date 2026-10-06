@@ -1893,13 +1893,37 @@ struct Index {
   }
 
   /**
-   * 统一取图通道（保存/复制/分享共用）：
-   * 1) 原生直取（URL 候选 × Referer 策略组合重试，含魔数校验）
-   * 2) 页面内 fetch 兜底（同源图/带 CORS 头的跨域图，与 <img> 同凭证上下文）
-   * 3) WebView 网络栈下载兜底
-   * 每级开始均有 toast 进度提示；调用方另有 45s 总看门狗。
+   * 统一取图通道（保存/复制/分享共用）——主链路与保存图片完全一致：
+   * 1) 资源嗅探缓存命中（页面加载图片时后台已抓取，字节直接可用）
+   * 2) nas_nav 1:1 默认参数单次 GET（无自定义 UA/Referer，避开图源防盗链拦截，
+   *    与 doDirectSave 的 copyUrlPicToFilesDir 同构）
+   * 3) 兜底：多策略 Referer 矩阵 → 页面内 fetch → WebView 网络栈下载
+   * 每级开始均有 toast 进度提示。
    */
   private async getWebImageBytes(url: string): Promise<ArrayBuffer> {
+    // 1) 嗅探缓存：与保存同链路的第一优先级
+    const cached: ArrayBuffer | null =
+      url.length > 0 ? ImageResourceSniffer.getCached(url) : null;
+    if (cached && cached.byteLength > 0) {
+      hilog.info(0x0000, TAG, 'sniffer cache hit for copy/share: %{public}d B', cached.byteLength);
+      return cached;
+    }
+    // 2) nas_nav 1:1 默认参数 GET（保存图片的实测可用通道，无任何请求头篡改）
+    promptAction.showToast({ message: '正在获取图片…', duration: 2000 });
+    try {
+      const buf: ArrayBuffer = await this.fetchBytesDefaultGet(url);
+      if (buf && buf.byteLength > 0 && WebImageSaver.isImageBytes(buf)) {
+        hilog.info(0x0000, TAG, 'default GET ok: %{public}d B', buf.byteLength);
+        return buf;
+      }
+      hilog.warn(0x0000, TAG, 'default GET: %{public}d B but not image',
+        buf ? buf.byteLength : 0);
+    } catch (err) {
+      const be = err as BusinessError;
+      hilog.warn(0x0000, TAG, 'default GET failed: %{public}s',
+        (be && be.message) ? be.message : '?');
+    }
+    // 3) 兜底：历史多策略链路（URL 候选 × Referer 矩阵 → 页面内 fetch → WebView 下载）
     const ctl: webview.WebviewController =
       this.detailVisible ? this.detailController : this.controller;
     let pageUrl: string = '';
@@ -1914,7 +1938,7 @@ struct Index {
     } catch (err) {
       cookie = '';
     }
-    promptAction.showToast({ message: '正在直连图源…', duration: 2000 });
+    promptAction.showToast({ message: '直连受限，正在多策略重试…', duration: 2000 });
     try {
       const data: ArrayBuffer =
         await WebImageSaver.fetchImageEx(url, pageUrl, cookie, this.userAgent);
@@ -1955,6 +1979,26 @@ struct Index {
     } catch (err) {
     }
     throw new Error('图片源拒绝访问[' + host + ']');
+  }
+
+  /**
+   * nas_nav 1:1 默认参数单次 GET（与保存图片的 copyUrlPicToFilesDir 同构，仅返回
+   * 字节不落盘）：无 header、无 expectDataType、无 maxLimit——图源按"原生默认行为"
+   * 放行，避开自定义 UA/Referer 触发的防盗链拦截。
+   */
+  private async fetchBytesDefaultGet(picUrl: string): Promise<ArrayBuffer> {
+    const httpRequest = http.createHttp();
+    try {
+      const data: http.HttpResponse =
+        await (httpRequest.request(picUrl) as Promise<http.HttpResponse>);
+      if (data && data.responseCode === http.ResponseCode.OK
+        && data.result instanceof ArrayBuffer) {
+        return data.result as ArrayBuffer;
+      }
+      return new ArrayBuffer(0);
+    } finally {
+      httpRequest.destroy();
+    }
   }
 
   /** 用 WebView 网络栈下载 URL 资源，返回文件字节（读完即删临时文件） */
