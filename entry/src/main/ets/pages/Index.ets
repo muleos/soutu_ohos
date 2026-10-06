@@ -1379,30 +1379,27 @@ struct Index {
       if (this.ctxVisible) {
         Column() {
           ForEach(this.ctxItems, (item: string) => {
-            // 「保存图片」行：渲染为可见的系统安全控件 SaveButton（安全控件不允许
-            // 透明/遮挡，必须可见点击才授予临时授权）——点击即按 nas_nav 1:1 流程
-            // 直接保存（单次 GET → 沙箱 → createImageAssetRequest 入库），无预览窗
+            // 「保存图片」行：仍渲染系统安全控件 SaveButton（临时授权直存图库的前提），
+            // 但样式定制为与普通菜单行一致——无图标、背景与菜单同色（安全控件禁止
+            // 透明/遮挡，用同色不透明背景实现"纯文字"观感）、字体颜色同其他行
             if (item === '保存图片') {
-              Row() {
-                SaveButton({
-                  icon: SaveIconStyle.FULL_FILLED,
-                  text: SaveDescription.SAVE_IMAGE,
-                  buttonType: ButtonType.Capsule
+              SaveButton({
+                text: SaveDescription.SAVE_IMAGE,
+                buttonType: ButtonType.Capsule
+              })
+                .width(170)
+                .height(44)
+                .fontSize(15)
+                .fontColor($r('app.color.dialog_text'))
+                .backgroundColor($r('app.color.ctx_menu_bg'))
+                .onClick((event: ClickEvent, result: SaveButtonOnClickResult): void => {
+                  if (result === SaveButtonOnClickResult.SUCCESS) {
+                    this.ctxVisible = false;
+                    this.doDirectSave(this.ctxUrl);
+                  } else if (result === SaveButtonOnClickResult.TEMPORARY_AUTHORIZATION_FAILED) {
+                    promptAction.showToast({ message: '临时授权失败，请重试' });
+                  }
                 })
-                  .width(130)
-                  .height(36)
-                  .onClick((event: ClickEvent, result: SaveButtonOnClickResult): void => {
-                    if (result === SaveButtonOnClickResult.SUCCESS) {
-                      this.ctxVisible = false;
-                      this.doDirectSave(this.ctxUrl);
-                    } else if (result === SaveButtonOnClickResult.TEMPORARY_AUTHORIZATION_FAILED) {
-                      promptAction.showToast({ message: '临时授权失败，请重试' });
-                    }
-                  })
-              }
-              .width(170)
-              .height(44)
-              .justifyContent(FlexAlign.Center)
             } else {
               Text(item)
                 .fontSize(15)
