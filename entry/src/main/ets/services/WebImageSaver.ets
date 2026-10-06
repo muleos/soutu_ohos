@@ -157,7 +157,7 @@ export class WebImageSaver {
       await helper.showAssetsCreationDialog([fileUri.getUriFromPath(cachePath)], [config]);
     if (created && created.length > 0) {
       const targetFile = fileIo.openSync(created[0], fileIo.OpenMode.READ_WRITE);
-      fileIo.writeSync(targetFile.fd, new Uint8Array(data));
+      fileIo.writeSync(targetFile.fd, data);
       fileIo.closeSync(targetFile);
       hilog.info(0x0000, TAG, 'saved via creation dialog: %{public}s', created[0]);
       return 'saved';
@@ -179,7 +179,7 @@ export class WebImageSaver {
       photoAccessHelper.getPhotoAccessHelper(context);
     const uri: string = await helper.createAsset(photoAccessHelper.PhotoType.IMAGE, ext);
     const targetFile = fileIo.openSync(uri, fileIo.OpenMode.READ_WRITE);
-    fileIo.writeSync(targetFile.fd, new Uint8Array(data));
+    fileIo.writeSync(targetFile.fd, data);
     fileIo.closeSync(targetFile);
     hilog.info(0x0000, TAG, 'saved via security button: %{public}s', uri);
   }
@@ -366,7 +366,10 @@ export class WebImageSaver {
     } catch (err) { }
     const path: string = dir + '/stq_' + Date.now() + '.' + ext;
     const file = fileIo.openSync(path, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
-    fileIo.writeSync(file.fd, new Uint8Array(data));
+    // v1.2.9 关键修复：写原始 ArrayBuffer（与图库保存链路一致）。此前传 Uint8Array 视图
+    // 在真机触发 "Invalid argument. Write failed. Invalid arraybuffer or options"，
+    // 导致分享图片必失败
+    fileIo.writeSync(file.fd, data);
     fileIo.closeSync(file);
     return path;
   }

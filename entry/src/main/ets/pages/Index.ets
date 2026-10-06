@@ -592,20 +592,10 @@ struct Index {
                   }
                 }
               })
-              // 资源嗅探（aira media discovery 同构）：页面加载图片时后台原生抓取字节入缓存，
-              // 长按保存直接命中缓存秒弹窗；返回 null 交内核正常加载，不影响显示
-              .onInterceptRequest((event) => {
-                if (event) {
-                  try {
-                    const u: string = event.request.getRequestUrl();
-                    if (ImageResourceSniffer.isLikelyImageUrl(u)) {
-                      ImageResourceSniffer.sniffAsync(u, this.userAgent);
-                    }
-                  } catch (err) {
-                  }
-                }
-                return null;
-              })
+              // v1.2.9 移除资源嗅探后台预取：此前页面每显示一张图片（信息流缩略图+详情原图）
+              // 原生层都会再下载一份入缓存，流量翻倍且 3 个并发请求与信息流加载抢带宽；
+              // 站点自身信息流已用 _fw480 缩略图、详情页才加载原图。保存/复制/分享均在
+              // 用户操作时单次默认参数 GET 直取（nas_nav 同款），无需预取缓存。
               //.cacheMode(CacheMode.Online)
               .domStorageAccess(true)
               //.multiWindowAccess(true)
@@ -796,19 +786,7 @@ struct Index {
               } catch (error) {
               }
             })
-            // 同主 Web：详情页资源嗅探
-            .onInterceptRequest((event) => {
-              if (event) {
-                try {
-                  const u: string = event.request.getRequestUrl();
-                  if (ImageResourceSniffer.isLikelyImageUrl(u)) {
-                    ImageResourceSniffer.sniffAsync(u, this.userAgent);
-                  }
-                } catch (err) {
-                }
-              }
-              return null;
-            })
+            // v1.2.9 同主 Web：详情页资源嗅探预取已移除（流量优化，见主 Web 注释）
             .onConsole((event) => {
               // 沉浸式取色桥：与主 Web 同一探针，浮层期间系统栏跟随详情页配色
               if (event && event.message) {
